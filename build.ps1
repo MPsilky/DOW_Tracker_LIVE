@@ -1,10 +1,11 @@
 # DOW 30 Tracker — One-Click Builder (GUI + Console)
 # Run in Administrator PowerShell inside the project folder.
-# Supports optional flags: -InstallDeps, -MakeInstaller
+# Supports optional flags: -InstallDeps, -MakeInstaller, -Run
 
 param(
   [switch]$InstallDeps = $false,
-  [switch]$MakeInstaller = $false
+  [switch]$MakeInstaller = $false,
+  [switch]$Run = $false
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,17 +25,16 @@ if (-not (Test-Path $MainPy)) {
     throw "Missing DOW30_Tracker_LIVE.py in $ProjectDir"
 }
 if (-not (Test-Path $Assets)) { New-Item -ItemType Directory -Force -Path $Assets | Out-Null }
-if (-not (Test-Path (Join-Path $Assets "dow.ico"))) { Write-Host "WARNING: assets\dow.ico missing (EXE will use default icon)" -ForegroundColor Yellow }
 if (-not (Test-Path $Data))   { New-Item -ItemType Directory -Force -Path $Data   | Out-Null }
 
 # Optional: refresh deps (use your active venv if any)
 if ($InstallDeps) {
     Write-Host ">> Installing/Upgrading build dependencies..." -ForegroundColor Cyan
-    python -V | Out-Null
-    python -m pip install --upgrade pip
-    pip install --upgrade pyinstaller PyQt5 pandas yfinance openpyxl
+    & python -V | Out-Null
+    & python -m pip install --upgrade pip
+    & python -m pip install --upgrade pyinstaller PyQt5 pandas yfinance openpyxl
     # Quiet some older hook weirdness
-    pip install --upgrade typing_extensions
+    & python -m pip install --upgrade typing_extensions
 }
 
 # --- FULL CLEAN ---
@@ -47,6 +47,17 @@ Get-ChildItem $ProjectDir -Recurse -Directory -Filter "__pycache__" -ErrorAction
 # Ensure 'data' exists so users have a predictable default folder
 if (-not (Test-Path $Data))   { New-Item -ItemType Directory -Force -Path $Data | Out-Null }
 
+$MainPy = (Resolve-Path -LiteralPath $MainPy).Path
+$AssetsResolved = (Resolve-Path -LiteralPath $Assets).Path
+$DataResolved = (Resolve-Path -LiteralPath $Data).Path
+$IconPath = Join-Path $AssetsResolved "dow.ico"
+$IconResolved = $null
+try { $IconResolved = (Resolve-Path -LiteralPath $IconPath).Path } catch { }
+if (-not $IconResolved) {
+    Write-Host "WARNING: assets\dow.ico missing (EXE will use default icon)" -ForegroundColor Yellow
+    $IconResolved = $IconPath
+}
+
 # Kill running copies so we can overwrite EXE safely
 Write-Host ">> Stopping any running instances..." -ForegroundColor Cyan
 $null = cmd /c "taskkill /IM DOW30_Tracker_LIVE.exe /F 2>nul" 
@@ -58,76 +69,63 @@ $null = cmd /c "taskkill /IM DOW30_Tracker_Console_LIVE.exe /F 2>nul"
 $CommonArgs = @(
   "--clean",
   "--noconfirm",
-  "--icon", "assets\dow.ico",
-  "--add-data", "assets;assets",
-  "--add-data", "data;data"
+  "--icon", $IconResolved,
+  "--add-data", "${AssetsResolved};assets",
+  "--add-data", "${DataResolved};data",
+  "--workpath", (Join-Path $ProjectDir "build"),
+  "--distpath", (Join-Path $ProjectDir "dist"),
+  "--specpath", $ProjectDir
 )
+
+function Invoke-PyInstaller {
+    param(
+        [string[]]$Arguments
+    )
+    Write-Host ("   python -m PyInstaller {0}" -f ($Arguments -join ' ')) -ForegroundColor DarkGray
+    & python -m PyInstaller @Arguments
+}
 
 # GUI build
 Write-Host ">> Building windowed EXE..." -ForegroundColor Cyan
-$GuiCmd = @(
-  $CommonArgs +
-  @("--onefile", "--windowed", "--name", "DOW30_Tracker_LIVE", "DOW30_Tracker_LIVE.py")
-)
-pyinstaller $GuiCmd
+$GuiCmd = $CommonArgs + @("--onefile", "--windowed", "--name", "DOW30_Tracker_LIVE", $MainPy)
+Invoke-PyInstaller -Arguments $GuiCmd
 
 # Console build
 Write-Host ">> Building console EXE..." -ForegroundColor Cyan
-$ConCmd = @(
-  $CommonArgs +
-  @("--onefile", "--console", "--name", "DOW30_Tracker_Console_LIVE", "DOW30_Tracker_LIVE.py")
-)
-pyinstaller $ConCmd
+$ConCmd = $CommonArgs + @("--onefile", "--console", "--name", "DOW30_Tracker_Console_LIVE", $MainPy)
+Invoke-PyInstaller -Arguments $ConCmd
 
 # Verify outputs
 if (-not (Test-Path "dist\DOW30_Tracker_LIVE.exe")) { throw "GUI EXE missing" }
 if (-not (Test-Path "dist\DOW30_Tracker_Console_LIVE.exe")) { throw "Console EXE missing" }
 
-# --- OPTIONAL: INNO SETUP (.iss) skeleton ---
+# --- OPTIONAL: INNO SETUP BUILD ---
 if ($MakeInstaller) {
-    $iss = @"
-#define MyAppName "DOW 30 Tracker"
-#define MyAppVersion "1.3.0"
-#define MyAppPublisher "You"
-#define MyAppExeName "DOW30_Tracker_LIVE.exe"
-
-[Setup]
-AppId={{D9C0DA7B-7F96-4F4D-889A-83ABF0A96C9D}
-AppName={#MyAppName}
-AppVersion={#MyAppVersion}
-AppPublisher={#MyAppPublisher}
-DefaultDirName={autopf}\{#MyAppName}
-DefaultGroupName={#MyAppName}
-DisableDirPage=no
-DisableProgramGroupPage=yes
-OutputDir=.
-OutputBaseFilename=DOW30_Tracker_LIVE-Installer
-Compression=lzma
-SolidCompression=yes
-WizardStyle=modern
-SetupIconFile=assets\dow.ico
-
-[Languages]
-Name: "english"; MessagesFile: "compiler:Default.isl"
-
-[Files]
-Source: "dist\DOW30_Tracker_LIVE.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs
-Source: "data\*";   DestDir: "{app}\data";   Flags: ignoreversion recursesubdirs
-
-[Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
-
-[Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
-"@
     $issPath = Join-Path $ProjectDir "DOW30_Tracker_LIVE.iss"
-    $iss | Set-Content -Path $issPath -Encoding UTF8
-    Write-Host ">> Inno Setup script created: $issPath" -ForegroundColor Green
+    if (-not (Test-Path $issPath)) {
+        Write-Host "!! DOW30_Tracker_LIVE.iss not found. Skipping installer build." -ForegroundColor Yellow
+    }
+    else {
+        $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue
+        if ($null -eq $iscc) {
+            Write-Host "!! Inno Setup Compiler (iscc.exe) not found in PATH. Install Inno Setup or launch from the Inno command prompt." -ForegroundColor Yellow
+            Write-Host "   You can still run iscc manually against $issPath once it is available." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host ">> Compiling installer with Inno Setup..." -ForegroundColor Cyan
+            & $iscc.Path $issPath
+        }
+    }
 }
 
 Write-Host ""
 Write-Host ">> Build complete." -ForegroundColor Green
-Write-Host "   GUI:     $ProjectDir\dist\DOW30_Tracker_LIVE.exe"
-Write-Host "   Console: $ProjectDir\dist\DOW30_Tracker_Console_LIVE.exe"
+$GuiExe = Join-Path $ProjectDir "dist\DOW30_Tracker_LIVE.exe"
+$ConsoleExe = Join-Path $ProjectDir "dist\DOW30_Tracker_Console_LIVE.exe"
+Write-Host "   GUI:     $GuiExe"
+Write-Host "   Console: $ConsoleExe"
+
+if ($Run) {
+    Write-Host ">> Launching GUI build..." -ForegroundColor Cyan
+    Start-Process -FilePath $GuiExe
+}

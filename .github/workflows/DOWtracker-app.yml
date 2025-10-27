@@ -1,0 +1,74 @@
+name: DOW 30 Tracker CI
+
+on:
+  push:
+    branches: [ main, master, work ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-compile:
+    name: Lint & Byte-Compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt', 'pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller pandas yfinance openpyxl PyQt5
+
+      - name: Static bytecode check
+        run: python -m compileall DOW30_Tracker_LIVE.py
+
+  windows-build:
+    name: Windows Build Smoke Test
+    runs-on: windows-latest
+    needs: lint-and-compile
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install build toolchain
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller pandas yfinance openpyxl PyQt5
+
+      - name: Build executables
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          ./build.ps1
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dow30-tracker-dist
+          path: |
+            dist/DOW30_Tracker_LIVE.exe
+            dist/DOW30_Tracker_Console_LIVE.exe
+          if-no-files-found: warn
