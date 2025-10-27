@@ -1,0 +1,83 @@
+name: DOW30 Tracker CI
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "DOW30_Tracker_LIVE.py"
+      - "requirements.txt"
+      - ".github/workflows/python-app.yml"
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - "DOW30_Tracker_LIVE.py"
+      - "requirements.txt"
+      - ".github/workflows/python-app.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Lint, import, and test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.10"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Upgrade pip tooling
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+
+      - name: Install dependencies
+        run: |
+          # If you provide requirements.txt we’ll honor it; otherwise install minimal deps for this app
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install PyQt5 yfinance pandas numpy openpyxl
+          fi
+          # Dev tools
+          pip install flake8 pytest
+
+      - name: Lint with flake8 (syntax/critical)
+        run: |
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Lint with flake8 (style, non-blocking)
+        run: |
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Smoke import (no GUI launch)
+        shell: bash
+        run: |
+          python - <<'PY'
+          # Ensure the module imports cleanly without starting the event loop.
+          import importlib.util, sys, pathlib
+          mod_path = pathlib.Path("DOW30_Tracker_LIVE.py").resolve()
+          spec = importlib.util.spec_from_file_location("DOW30_Tracker_LIVE", mod_path)
+          m = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(m)  # noqa
+          print("Import OK")
+          PY
+
+      - name: Run tests (if present)
+        shell: bash
+        run: |
+          if [ -d tests ]; then
+            pytest -q
+          else
+            echo "No tests/ directory found; skipping pytest."
+          fi
