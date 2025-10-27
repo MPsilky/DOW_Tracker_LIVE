@@ -1,0 +1,133 @@
+# DOW 30 Tracker — One-Click Builder (GUI + Console)
+# Run in Administrator PowerShell inside the project folder.
+# Supports optional flags: -InstallDeps, -MakeInstaller
+
+param(
+  [switch]$InstallDeps = $false,
+  [switch]$MakeInstaller = $false
+)
+
+$ErrorActionPreference = "Stop"
+
+# Auto-detect project dir
+$ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $ProjectDir
+
+Write-Host ">> Project: $ProjectDir" -ForegroundColor Cyan
+
+# Paths
+$Assets = Join-Path $ProjectDir "assets"
+$Data   = Join-Path $ProjectDir "data"
+$MainPy = Join-Path $ProjectDir "DOW30_Tracker_LIVE.py"
+
+if (-not (Test-Path $MainPy)) {
+    throw "Missing DOW30_Tracker_LIVE.py in $ProjectDir"
+}
+if (-not (Test-Path $Assets)) { New-Item -ItemType Directory -Force -Path $Assets | Out-Null }
+if (-not (Test-Path (Join-Path $Assets "dow.ico"))) { Write-Host "WARNING: assets\dow.ico missing (EXE will use default icon)" -ForegroundColor Yellow }
+if (-not (Test-Path $Data))   { New-Item -ItemType Directory -Force -Path $Data   | Out-Null }
+
+# Optional: refresh deps (use your active venv if any)
+if ($InstallDeps) {
+    Write-Host ">> Installing/Upgrading build dependencies..." -ForegroundColor Cyan
+    python -V | Out-Null
+    python -m pip install --upgrade pip
+    pip install --upgrade pyinstaller PyQt5 pandas yfinance openpyxl
+    # Quiet some older hook weirdness
+    pip install --upgrade typing_extensions
+}
+
+# --- FULL CLEAN ---
+Write-Host ">> Cleaning previous artifacts..." -ForegroundColor Cyan
+$toDelete = @("build","dist")
+foreach ($d in $toDelete) { if (Test-Path $d) { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue } }
+Get-ChildItem $ProjectDir -Filter "*.spec" -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem $ProjectDir -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+# Ensure 'data' exists so users have a predictable default folder
+if (-not (Test-Path $Data))   { New-Item -ItemType Directory -Force -Path $Data | Out-Null }
+
+# Kill running copies so we can overwrite EXE safely
+Write-Host ">> Stopping any running instances..." -ForegroundColor Cyan
+$null = cmd /c "taskkill /IM DOW30_Tracker_LIVE.exe /F 2>nul" 
+$null = cmd /c "taskkill /IM DOW30_Tracker_Console_LIVE.exe /F 2>nul"
+
+# --- BUILD COMMANDS ---
+# Bundle assets and (empty) data dir so the app has a writable sibling by default.
+# Windows add-data format: "src;dest"
+$CommonArgs = @(
+  "--clean",
+  "--noconfirm",
+  "--icon", "assets\dow.ico",
+  "--add-data", "assets;assets",
+  "--add-data", "data;data"
+)
+
+# GUI build
+Write-Host ">> Building windowed EXE..." -ForegroundColor Cyan
+$GuiCmd = @(
+  $CommonArgs +
+  @("--onefile", "--windowed", "--name", "DOW30_Tracker_LIVE", "DOW30_Tracker_LIVE.py")
+)
+pyinstaller $GuiCmd
+
+# Console build
+Write-Host ">> Building console EXE..." -ForegroundColor Cyan
+$ConCmd = @(
+  $CommonArgs +
+  @("--onefile", "--console", "--name", "DOW30_Tracker_Console_LIVE", "DOW30_Tracker_LIVE.py")
+)
+pyinstaller $ConCmd
+
+# Verify outputs
+if (-not (Test-Path "dist\DOW30_Tracker_LIVE.exe")) { throw "GUI EXE missing" }
+if (-not (Test-Path "dist\DOW30_Tracker_Console_LIVE.exe")) { throw "Console EXE missing" }
+
+# --- OPTIONAL: INNO SETUP (.iss) skeleton ---
+if ($MakeInstaller) {
+    $iss = @"
+#define MyAppName "DOW 30 Tracker"
+#define MyAppVersion "1.3.0"
+#define MyAppPublisher "You"
+#define MyAppExeName "DOW30_Tracker_LIVE.exe"
+
+[Setup]
+AppId={{D9C0DA7B-7F96-4F4D-889A-83ABF0A96C9D}
+AppName={#MyAppName}
+AppVersion={#MyAppVersion}
+AppPublisher={#MyAppPublisher}
+DefaultDirName={autopf}\{#MyAppName}
+DefaultGroupName={#MyAppName}
+DisableDirPage=no
+DisableProgramGroupPage=yes
+OutputDir=.
+OutputBaseFilename=DOW30_Tracker_LIVE-Installer
+Compression=lzma
+SolidCompression=yes
+WizardStyle=modern
+SetupIconFile=assets\dow.ico
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Files]
+Source: "dist\DOW30_Tracker_LIVE.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs
+Source: "data\*";   DestDir: "{app}\data";   Flags: ignoreversion recursesubdirs
+
+[Icons]
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+
+[Run]
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+"@
+    $issPath = Join-Path $ProjectDir "DOW30_Tracker_LIVE.iss"
+    $iss | Set-Content -Path $issPath -Encoding UTF8
+    Write-Host ">> Inno Setup script created: $issPath" -ForegroundColor Green
+}
+
+Write-Host ""
+Write-Host ">> Build complete." -ForegroundColor Green
+Write-Host "   GUI:     $ProjectDir\dist\DOW30_Tracker_LIVE.exe"
+Write-Host "   Console: $ProjectDir\dist\DOW30_Tracker_Console_LIVE.exe"
