@@ -5,17 +5,23 @@ DOW 30 Tracker — market-hours only (no after-hours)
 - Single instance (second run focuses the first)
 - Backfill full day on launch; live capture during session
 - Buckets: 9:31 AM, 10:00 AM, 11:00 AM, 12 NOON, 1:00 PM, 2:00 PM, 3:00 PM, 4:00 PM
-- Arrows / % / colors are always vs the previous bucket (9:31 vs yesterday's close)
+- Arrows / % / colors compare each bucket to the immediately prior bucket (9:31 uses the prior session's 4:00 PM capture, then
+  falls back to the latest close if needed)
 - Excel export: daily file "Sheet__MM_DD_YYYY.xlsx"
   * Grid sheet mirrors the UI (tickers + all buckets)
   * One sheet per bucket with numeric `price` and `pct` columns
 - User-selectable data folder (remembered in settings.json)
 """
 
-import os, sys, json, socket, threading, math, traceback, re
+import os, sys, json, socket, threading, traceback, re, atexit, io
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
 from typing import Any, Dict, Optional, List, Tuple, Callable, cast
+
+try:
+    from zoneinfo import ZoneInfo  # type: ignore
+except Exception:
+    ZoneInfo = None  # type: ignore[assignment]
 
 # -------- optional deps (guarded) --------
 try:
@@ -75,8 +81,87 @@ def resource_path(rel: str) -> str:
 def exe_path() -> str:
     return sys.executable if getattr(sys, "frozen", False) else os.path.abspath(sys.argv[0])
 
-SETTINGS_JSON = Path.home() / "AppData" / "Local" / "DOW30Tracker" / "settings.json"
-SETTINGS_JSON.parent.mkdir(parents=True, exist_ok=True)
+if sys.platform.startswith("win"):
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        STATE_DIR = Path(local_appdata) / "DOW30Tracker"
+    else:
+        STATE_DIR = Path.home() / "AppData" / "Local" / "DOW30Tracker"
+else:
+    STATE_DIR = Path.home() / ".dow30tracker"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+SETTINGS_JSON = STATE_DIR / "settings.json"
+INSTANCE_LOCK = STATE_DIR / "tracker.lock"
+_LOCK_HANDLE: Optional["io.TextIOWrapper"] = None  # kept alive for the process lifetime
+
+class _SingleInstanceError(RuntimeError):
+    pass
+
+def _acquire_lock() -> None:
+    global _LOCK_HANDLE
+    if _LOCK_HANDLE is not None:
+        return
+    try:
+        fh = INSTANCE_LOCK.open("a+")
+        if os.name == "nt":
+            import msvcrt  # type: ignore
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                fh.close()
+                raise _SingleInstanceError
+        else:
+            import fcntl  # type: ignore
+            try:
+                fcntl.lockf(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                fh.close()
+                raise _SingleInstanceError
+        _LOCK_HANDLE = fh
+    except FileNotFoundError:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        _acquire_lock()
+
+def _release_lock() -> None:
+    global _LOCK_HANDLE
+    if _LOCK_HANDLE is None:
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt  # type: ignore
+            try:
+                _LOCK_HANDLE.seek(0)
+                msvcrt.locking(_LOCK_HANDLE.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        else:
+            import fcntl  # type: ignore
+            try:
+                fcntl.lockf(_LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        try:
+            _LOCK_HANDLE.close()
+        except Exception:
+            pass
+        _LOCK_HANDLE = None
+
+atexit.register(_release_lock)
+
+def _notify_existing_instance() -> None:
+    try:
+        with socket.create_connection(("127.0.0.1", APP_PORT), timeout=1.5) as c:
+            c.sendall(b"SHOW")
+    except Exception:
+        pass
+
+def ensure_single_instance() -> None:
+    try:
+        _acquire_lock()
+    except _SingleInstanceError:
+        _notify_existing_instance()
+        sys.exit(0)
 
 def load_settings() -> Dict[str, Any]:
     try:
@@ -91,15 +176,24 @@ def save_settings(s: Dict[str, Any]) -> None:
     SETTINGS_JSON.write_text(json.dumps(s, indent=2), encoding="utf-8")
 
 def default_data_dir() -> Path:
-    try:
-        base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
-        data = base / "data"
-        data.mkdir(exist_ok=True)
-        return data
-    except Exception:
-        d = Path.home() / "Documents" / "Saved DOW Sheets"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+    doc_candidates: List[Path] = []
+    home = Path.home()
+    doc_candidates.append(home / "Documents" / "Saved DOW Sheets")
+    if sys.platform.startswith("win"):
+        # Honour OneDrive documents if present
+        for env_key in ("OneDriveCommercial", "OneDriveConsumer", "ONEDRIVE", "OneDrive"):
+            onedrive = os.environ.get(env_key)
+            if onedrive:
+                doc_candidates.insert(0, Path(onedrive) / "Documents" / "Saved DOW Sheets")
+    for candidate in doc_candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except Exception:
+            continue
+    fallback = STATE_DIR / "Saved"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
 
 def get_data_dir() -> Path:
     s = load_settings()
@@ -112,6 +206,79 @@ def get_data_dir() -> Path:
 DATA_DIR = get_data_dir()
 LOG_PATH = DATA_DIR / "tracker.log"
 FEATURES_JSON = DATA_DIR / "features.json"
+
+_WORKBOOK_RE = re.compile(r"Sheet__(\d{2})_(\d{2})_(\d{4})\.xlsx$", re.IGNORECASE)
+_PRIOR_BUCKET_CACHE: Dict[Tuple[str, str], Dict[str, Optional[float]]]
+_PRIOR_BUCKET_CACHE = {}
+
+
+def _parse_workbook_date(path: Path) -> Optional[date]:
+    m = _WORKBOOK_RE.match(path.name)
+    if not m:
+        return None
+    try:
+        month, day, year = map(int, m.groups())
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def _latest_workbook_before(session_day: date, data_dir: Path) -> Optional[Path]:
+    best: Optional[Tuple[date, Path]] = None
+    try:
+        for path in data_dir.glob("Sheet__*.xlsx"):
+            dt = _parse_workbook_date(path)
+            if dt is None or dt >= session_day:
+                continue
+            if best is None or dt > best[0]:
+                best = (dt, path)
+    except Exception as e:
+        log(f"scan workbooks err: {e}")
+        return None
+    return best[1] if best else None
+
+
+def _load_bucket_from_workbook(path: Path, bucket_label: str) -> Dict[str, Optional[float]]:
+    cache_key = (str(path.resolve()), bucket_label)
+    cached = _PRIOR_BUCKET_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+    if openpyxl is None:
+        return {}
+    try:
+        from openpyxl import load_workbook
+
+        sheet_name = safe_sheet_name(bucket_label)
+        wb = load_workbook(path, data_only=True, read_only=True)
+        if sheet_name not in wb.sheetnames:
+            wb.close()
+            return {}
+        ws = wb[sheet_name]
+        result: Dict[str, Optional[float]] = {}
+        for row_idx, tk in enumerate(TICKERS, start=2):
+            val = ws.cell(row=row_idx, column=2).value
+            result[tk] = float(val) if isinstance(val, (int, float)) else None
+        wb.close()
+        _PRIOR_BUCKET_CACHE[cache_key] = dict(result)
+        return result
+    except Exception as e:
+        log(f"load workbook bucket err: {e}")
+        return {}
+
+
+def prior_session_bucket(session_day: date, bucket_label: str = "4:00 PM", data_dir: Optional[Path] = None) -> Dict[str, Optional[float]]:
+    directory = data_dir if data_dir is not None else DATA_DIR
+    path = _latest_workbook_before(session_day, directory)
+    if path is None:
+        return {}
+    bucket = _load_bucket_from_workbook(path, bucket_label)
+    if not bucket:
+        log(f"no prior bucket data for {bucket_label} in {path.name}")
+    return bucket
+
+
+def clear_prior_bucket_cache() -> None:
+    _PRIOR_BUCKET_CACHE.clear()
 
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -130,11 +297,7 @@ def start_primary_socket() -> socket.socket:
         s.listen(1)
         return s
     except OSError:
-        try:
-            with socket.create_connection(("127.0.0.1", APP_PORT), timeout=1.5) as c:
-                c.sendall(b"SHOW")
-        except Exception:
-            pass
+        _notify_existing_instance()
         sys.exit(0)
 
 def socket_listener(sock: socket.socket, on_show: Callable[[], None]) -> None:
@@ -152,17 +315,17 @@ def socket_listener(sock: socket.socket, on_show: Callable[[], None]) -> None:
 
 # -------- features (the toggles remain; explainer copy updated) --------
 FEATURE_ITEMS: List[Tuple[str,str]] = [
-    ("Mini “Dow Dashboard” with Market Mood", "Breadth, best/worst, concentration."),
-    ("Auto News Ping for Movers", "Tray balloon for biggest mover + headline."),
-    ("Chart Sparkline View", "Unicode mini-sparkline from intraday 1m data."),
-    ("Replay Mode", "Play back saved captures."),
-    ("Morning Resume Summary", "Toast with yesterday best/worst at start."),
-    ("Historical Echo Mode", "On ±2% intraday, show last similar move & next day."),
-    ("Dow “Concentration” Meter", "Top-5 movers’ share of movement."),
-    ("Custom Market Sounds", "Beep when |move| ≥ threshold."),
-    ("Candle Ghosts", "Show ‘ghost:<yday close>’ baseline."),
-    ("Daily Confidence Meter", "Breadth meter (advancers/30)."),
-    ("“Dow DNA” Export", "Weekly correlations & vol to CSV."),
+    ("Mini \"Dow Dashboard\" Pulse", "Bright banner showing advancers vs decliners, top movers, and an instant mood check."),
+    ("Auto News Ping for Movers", "Tray balloon with the day's biggest mover plus its freshest headline."),
+    ("Chart Sparkline View", "Unicode sparkline built from 1-minute closes so you can spot slope without leaving the grid."),
+    ("Replay Mode", "Scrub through saved captures to relive the session or clip highlights."),
+    ("Morning Resume Summary", "Morning toast recapping yesterday's leaders, laggards, and index finish."),
+    ("Historical Echo Mode", "On ±2% swings, surface the closest historical analog and what happened next."),
+    ("Dow \"Concentration\" Meter", "Gauge how much of the move the top five components are driving."),
+    ("Custom Market Sounds", "Play chimes whenever a component crosses your chosen percentage threshold."),
+    ("Candle Ghosts", "Overlay a ghost line at yesterday's close for quick anchoring."),
+    ("Daily Confidence Meter", "Animated breadth bar that tracks advancers out of 30 throughout the day."),
+    ("\"Dow DNA\" Export", "Weekly CSV drop with correlations, realized vol, and stat blocks."),
 ]
 
 # -------- finance helpers and intraday caching --------
@@ -174,14 +337,38 @@ def _df_empty(x: Any) -> bool:
         return True
 
 def _ny_tz() -> str:
-    return "US/Eastern"
+    return "America/New_York"
+
+
+def now_eastern() -> datetime:
+    if ZoneInfo is not None:
+        try:
+            return datetime.now(tz=ZoneInfo("America/New_York"))
+        except Exception:
+            pass
+    try:
+        import pytz  # type: ignore
+
+        return datetime.now(tz=pytz.timezone("US/Eastern"))
+    except Exception:
+        return datetime.now()
+
+
+def format_et(dt: datetime) -> str:
+    try:
+        text = dt.strftime("%I:%M %p")
+        if text.startswith("0"):
+            text = text[1:]
+        return f"{text} ET"
+    except Exception:
+        return dt.strftime("%H:%M ET")
 
 # Intraday cache
 _intraday_cache: Dict[str, "pd.Series"] = {}
 
 def _load_intraday_cache() -> None:
     """
-    Populate `_intraday_cache` with 1‑minute close price series for all
+    Populate `_intraday_cache` with 1-minute close price series for all
     tickers for the current trading day.  A single call to
     `yfinance.download` fetches data efficiently.  If yfinance or
     pandas are unavailable, the function quietly returns.
@@ -200,6 +387,7 @@ def _load_intraday_cache() -> None:
             progress=False,
             threads=True,
         )
+        new_cache: Dict[str, "pd.Series"] = {}
         for tk in TICKERS:
             s: Optional[pd.Series] = None
             if isinstance(df, dict):
@@ -220,16 +408,18 @@ def _load_intraday_cache() -> None:
                     s = s.tz_localize(_ny_tz())  # type: ignore[attr-defined]
                 else:
                     s = s.tz_convert(_ny_tz())   # type: ignore[attr-defined]
-                _intraday_cache[tk] = s.dropna()
+                new_cache[tk] = s.dropna()
+        if new_cache:
+            _intraday_cache = new_cache
     except Exception as e:
         log(f"_load_intraday_cache err: {e}")
 
 def series_for_day_1m(tk: str) -> Optional["pd.Series"]:
     """
-    Return the cached 1‑minute close price series for the given ticker
+    Return the cached 1-minute close price series for the given ticker
     if available.  If the cache is empty or the ticker has not yet
     been cached, fall back to a fresh yfinance.Ticker() call.  This
-    provides an escape hatch if the cache hasn’t been loaded.
+    provides an escape hatch if the cache has not been loaded.
     """
     if yf is None or pd is None:
         return None
@@ -250,13 +440,13 @@ def series_for_day_1m(tk: str) -> Optional["pd.Series"]:
         log(f"series_for_day_1m({tk}) err: {e}")
         return None
 
-def price_at_or_before_bucket(tk: str, h: int, m: int) -> Optional[float]:
+def price_at_or_before_bucket(tk: str, session_day: date, h: int, m: int) -> Optional[float]:
     if pd is None:
         return None
     s = series_for_day_1m(tk)
     if s is None or s.empty:
         return last_close(tk)
-    bkt = pd.Timestamp(datetime.now().year, datetime.now().month, datetime.now().day, h, m, tz=_ny_tz())
+    bkt = pd.Timestamp(session_day.year, session_day.month, session_day.day, h, m, tz=_ny_tz())
     try:
         v = s.asof(bkt)  # type: ignore[attr-defined]
         if v is None and len(s) > 0:
@@ -288,9 +478,9 @@ def last_close(tk: str) -> Optional[float]:
         log(f"last_close({tk}) err: {e}"); return None
 
 # -------- UI helpers --------
-GREEN = QColor(16,124,16)
-RED   = QColor(180,32,32)
-NEUT  = QColor(60,60,60)
+GREEN = QColor("#22c55e")
+RED   = QColor("#f87171")
+NEUT  = QColor("#e2e8f0")
 
 def make_cell(text: str, pct: Optional[float]) -> QTableWidgetItem:
     it = QTableWidgetItem(text)
@@ -326,7 +516,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_NAME); self.setWindowIcon(self._icon()); self.resize(1400, 860)
 
         self.features = self._load_features()
-        self.last_pct: Dict[str, float] = {}
+        self.session_date = now_eastern().date()
+        self.prev_close: Dict[str, Optional[float]] = {}
+        self.prev_session_bucket: Dict[str, Optional[float]] = prior_session_bucket(self.session_date)
+        self.bucket_prices: Dict[str, Dict[str, Optional[float]]] = {tk: {} for tk in TICKERS}
+        self._exported_states: Dict[str, Tuple[Optional[float], ...]] = {}
+        self._last_timer_key: Optional[Tuple[int, int]] = None
 
         # table
         self.table = QTableWidget(len(TICKERS), 1 + len(TIME_COLS))
@@ -334,33 +529,56 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setVisible(False)
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(QHeaderView.ResizeToContents)
+        hh.setDefaultAlignment(Qt.AlignCenter)
+        hh.setSectionResizeMode(0, QHeaderView.Fixed)
 
-        # bigger UI
-        base_font = QFont(); base_font.setPointSize(12)
+        base_font = QFont(); base_font.setPointSize(13)
         self.setFont(base_font)
         self.table.setFont(base_font)
-        self.table.setStyleSheet("""
-            QTableWidget { alternate-background-color:#fafafa; font-size:13px; }
-            QHeaderView::section { padding:8px 12px; font-size:13px; }
-        """)
+        self.table.setFocusPolicy(Qt.NoFocus)
         self.table.setAlternatingRowColors(True)
         for r in range(len(TICKERS)):
-            self.table.setRowHeight(r, 28)
+            self.table.setRowHeight(r, 34)
 
-        fbold = QFont(); fbold.setPointSize(12); fbold.setBold(True)
+        fbold = QFont(); fbold.setPointSize(13); fbold.setBold(True)
+        first_col_bg = QBrush(QColor("#1e293b"))
         for i, tk in enumerate(TICKERS, start=1):
             it = QTableWidgetItem(f"{i}. {tk}")
             it.setFont(fbold)
-            it.setForeground(QBrush(QColor("blue") if tk in ("INTC","WBA") else QColor("black")))
+            color = QColor("#38bdf8") if tk in ("INTC","WBA") else QColor("#f8fafc")
+            it.setForeground(QBrush(color))
+            it.setBackground(first_col_bg)
+            it.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
             it.setFlags(it.flags() & ~Qt.ItemIsEditable)
             self.table.setItem(i-1, 0, it)
+        self.table.setColumnWidth(0, 150)
         self.setCentralWidget(self.table)
 
         # toolbar
         tb = QToolBar("Main"); tb.setIconSize(QSize(22,22)); tb.setMovable(False)
-        tb.setStyleSheet("QToolBar{padding:8px; font-size:13px;} QToolButton{padding:8px 12px;}")
         ftb = QFont(); ftb.setPointSize(12); ftb.setBold(True); tb.setFont(ftb)
+        tb.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.addToolBar(Qt.TopToolBarArea, tb)
+
+        self.setStyleSheet(
+            "QMainWindow { background-color: #0f172a; }\n"
+            "QToolBar { background: transparent; padding: 12px; spacing: 6px; }\n"
+            "QToolButton { color: #f8fafc; padding: 8px 14px; border-radius: 6px; background-color: rgba(37, 99, 235, 0.18); }\n"
+            "QToolButton:hover { background-color: #2563eb; color: #f8fafc; }\n"
+            "QToolButton:checked { background-color: #1d4ed8; color: #f8fafc; }\n"
+            "QTableWidget { background-color: #0b1220; color: #e2e8f0; gridline-color: #1f2a40; alternate-background-color: #131d33; selection-background-color: #2563eb; selection-color: #f8fafc; border: 1px solid #1f2a40; }\n"
+            "QTableWidget::item { padding: 6px 10px; }\n"
+            "QHeaderView::section { background-color: #1e293b; color: #f8fafc; font-size: 13px; padding: 10px 12px; border: 0; }\n"
+            "QStatusBar { background: #111827; color: #f8fafc; font-weight: 600; padding: 4px 12px; }\n"
+            "QMenu { background: #0f172a; color: #f8fafc; border: 1px solid #1f2a40; }\n"
+            "QMenu::item:selected { background: #2563eb; }\n"
+            "QDialog { background-color: #0f172a; color: #f1f5f9; }\n"
+            "QLabel { color: #f1f5f9; }\n"
+            "QTextEdit { background-color: #0b1220; color: #e2e8f0; border: 1px solid #1f2a40; }\n"
+            "QPushButton { background-color: #1d4ed8; border-radius: 6px; padding: 8px 16px; color: #f8fafc; font-weight: 600; }\n"
+            "QPushButton:hover { background-color: #2563eb; }\n"
+            "QCheckBox { color: #f1f5f9; font-size: 13px; }"
+        )
 
         self.actRefresh = QAction("Refresh", self); self.actRefresh.triggered.connect(self.refresh_now); tb.addAction(self.actRefresh)
         self.actBrowse  = QAction("Browse Excels", self); self.actBrowse.triggered.connect(self.browse_excels); tb.addAction(self.actBrowse)
@@ -375,6 +593,10 @@ class MainWindow(QMainWindow):
         self.optArw   = QAction("Arrows",     self, checkable=True, checked=True)
         self.optStripe= QAction("Stripe Rows",self, checkable=True, checked=True)
         for a in (self.optTimes, self.optPct, self.optArw, self.optStripe): tb.addAction(a)
+        self.optTimes.toggled.connect(self._toggle_times)
+        self.optPct.toggled.connect(lambda _: self._rerender_table())
+        self.optArw.toggled.connect(lambda _: self._rerender_table())
+        self.optStripe.toggled.connect(self._toggle_stripes)
 
         tb.addSeparator()
         self.actFeatures = QAction("Features", self); self.actFeatures.triggered.connect(self.open_features); tb.addAction(self.actFeatures)
@@ -399,9 +621,53 @@ class MainWindow(QMainWindow):
         self.live_timer = QTimer(self); self.live_timer.timeout.connect(self.timer_logic); self.live_timer.start(60_000)
         QTimer.singleShot(60, self.initial_sync)
 
-        self.statusBar().showMessage("Ready.")
+        status_font = QFont(); status_font.setPointSize(11); status_font.setBold(True)
+        self.statusBar().setFont(status_font)
+        self.statusBar().setSizeGripEnabled(False)
+        self.statusBar().showMessage("Ready — waiting for the first capture at 9:31 AM ET.")
 
     # ---------- core rendering ----------
+    def _reset_for_new_session(self, new_date: Optional[date] = None) -> None:
+        self.session_date = new_date or now_eastern().date()
+        self.prev_close = {}
+        clear_prior_bucket_cache()
+        self.prev_session_bucket = prior_session_bucket(self.session_date)
+        self.bucket_prices = {tk: {} for tk in TICKERS}
+        self._exported_states = {}
+        self._last_timer_key = None
+        for r in range(len(TICKERS)):
+            for c in range(1, 1 + len(TIME_COLS)):
+                blank = QTableWidgetItem("")
+                blank.setFlags(blank.flags() & ~Qt.ItemIsEditable)
+                self.table.setItem(r, c, blank)
+
+    def _ensure_session(self, current_date: Optional[date] = None) -> None:
+        target = current_date or now_eastern().date()
+        if target != self.session_date:
+            self._reset_for_new_session(target)
+
+    def _ensure_prev_close(self, tk: str) -> Optional[float]:
+        if tk not in self.prev_close or self.prev_close[tk] is None:
+            self.prev_close[tk] = last_close(tk)
+        return self.prev_close.get(tk)
+
+    def _base_for(self, tk: str, label: str) -> Optional[float]:
+        idx = LABEL_TO_INDEX[label]
+        if idx == 0:
+            prior_val = self.prev_session_bucket.get(tk)
+            if isinstance(prior_val, (int, float)):
+                return prior_val
+            return self._ensure_prev_close(tk)
+
+        bucket_dict = self.bucket_prices.get(tk, {})
+        for prev_idx in range(idx - 1, -1, -1):
+            prev_label = INDEX_TO_LABEL[prev_idx]
+            prev_val = bucket_dict.get(prev_label)
+            if isinstance(prev_val, (int, float)):
+                return prev_val
+
+        return self._ensure_prev_close(tk)
+
     def _render_cell(self, price: Optional[float], base: Optional[float]) -> Tuple[str, Optional[float], QTableWidgetItem]:
         pct: Optional[float] = None
         if isinstance(price, (int, float)) and isinstance(base, (int, float)) and base:
@@ -418,6 +684,22 @@ class MainWindow(QMainWindow):
         it.setForeground(QBrush(col))
         it.setFlags(it.flags() & ~Qt.ItemIsEditable)
         return text, pct, it
+
+    def _rerender_table(self) -> None:
+        for label in TIME_COLS:
+            col = 1 + LABEL_TO_INDEX[label]
+            for row, tk in enumerate(TICKERS):
+                price = self.bucket_prices.get(tk, {}).get(label)
+                base = self._base_for(tk, label)
+                _txt, _pct, item = self._render_cell(price, base)
+                self.table.setItem(row, col, item)
+
+    def _toggle_times(self, checked: bool) -> None:
+        self.table.horizontalHeader().setVisible(checked)
+
+    def _toggle_stripes(self, checked: bool) -> None:
+        self.table.setAlternatingRowColors(checked)
+        self.table.viewport().update()
 
     # ---------- settings / features ----------
     def _load_features(self) -> Dict[str,bool]:
@@ -439,6 +721,9 @@ class MainWindow(QMainWindow):
             LOG_PATH = DATA_DIR / "tracker.log"
             FEATURES_JSON = DATA_DIR / "features.json"
             DATA_DIR.mkdir(parents=True, exist_ok=True)
+            clear_prior_bucket_cache()
+            self.prev_session_bucket = prior_session_bucket(self.session_date)
+            self._rerender_table()
             self.tray.showMessage(APP_NAME, f"Data folder set to:\n{d}", QSystemTrayIcon.Information, 2500)
 
     # ---------- app logic ----------
@@ -458,67 +743,60 @@ class MainWindow(QMainWindow):
             log(f"initial_sync err: {e}")
 
     def timer_logic(self) -> None:
-        h, m = datetime.now().hour, datetime.now().minute
-        if (MARKET_OPEN <= (h,m) <= MARKET_CLOSE):
+        now_dt = now_eastern()
+        hm = (now_dt.hour, now_dt.minute)
+        if self._last_timer_key == hm:
+            return
+        self._last_timer_key = hm
+        if MARKET_OPEN <= hm <= MARKET_CLOSE:
             self.refresh_now()
         else:
-            self.statusBar().showMessage("Outside market hours — next capture at next session open.")
+            self.statusBar().showMessage("Outside market hours — next capture at next session open.", 4000)
 
     def browse_excels(self) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        path, _ = QFileDialog.getOpenFileName(self, "Open captured workbook", str(DATA_DIR), "Excel (*.xlsx)")
         try:
-            if path:
-                if sys.platform.startswith("win"): os.startfile(path)  # type: ignore[attr-defined]
-                else: QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+            if sys.platform.startswith("win"):
+                os.startfile(str(DATA_DIR))  # type: ignore[attr-defined]
             else:
-                if sys.platform.startswith("win"): os.startfile(str(DATA_DIR))  # type: ignore[attr-defined]
-                else: QDesktopServices.openUrl(QUrl.fromLocalFile(str(DATA_DIR)))
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(DATA_DIR)))
         except Exception as e:
             QMessageBox.warning(self, APP_NAME, f"Could not open: {e}")
 
     # ---------- capture ----------
-    def _bucket_index_now(self) -> Optional[int]:
-        hm = (datetime.now().hour, datetime.now().minute)
+    def _bucket_index_now(self, hm: Optional[Tuple[int, int]] = None) -> Optional[int]:
+        hour_min = hm or (now_eastern().hour, now_eastern().minute)
         idx = -1
         for i,(_, (h,m)) in enumerate(BUCKETS):
-            if hm >= (h,m): idx = i
+            if hour_min >= (h,m): idx = i
         return idx if idx >= 0 else None
 
     def backfill_to_now(self) -> None:
         if pd is None: return
         try:
-            idx_now = self._bucket_index_now()
+            now_dt = now_eastern()
+            hm = (now_dt.hour, now_dt.minute)
+            self._ensure_session(now_dt.date())
+            idx_now = self._bucket_index_now(hm)
             if idx_now is None: return
 
-            prev_closes = {tk: last_close(tk) for tk in TICKERS}
+            for tk in TICKERS:
+                self._ensure_prev_close(tk)
 
             for b in range(0, idx_now + 1):
                 col = 1 + b
                 h, m = BUCKETS[b][1]
+                label = INDEX_TO_LABEL[b]
                 for r, tk in enumerate(TICKERS):
-                    price = price_at_or_before_bucket(tk, h, m)
-
-                    if b == 0:
-                        base = prev_closes.get(tk)
-                    else:
-                        base = None
-                        prev_item = self.table.item(r, col - 1)
-                        if prev_item and prev_item.text():
-                            try:
-                                base = parse_price_pct(prev_item.text())[0]
-                            except Exception:
-                                base = None
-                        if base is None:
-                            base = prev_closes.get(tk)
-
+                    price = price_at_or_before_bucket(tk, self.session_date, h, m)
+                    base = self._base_for(tk, label)
                     _txt, pct, item = self._render_cell(price, base)
                     self.table.setItem(r, col, item)
-                    if isinstance(pct, (int, float)):
-                        self.last_pct[tk] = pct
+                    self.bucket_prices[tk][label] = price if isinstance(price, (int, float)) else None
+                self._maybe_export(label)
 
-            self.statusBar().showMessage(f"Backfilled through {INDEX_TO_LABEL[idx_now]}")
-            self._export_excel_grid_and_bucket(INDEX_TO_LABEL[idx_now])
+            last_label = INDEX_TO_LABEL[idx_now]
+            self.statusBar().showMessage(f"Backfilled through {last_label} @ {format_et(now_dt)}", 4000)
 
         except Exception as e:
             log(f"backfill_to_now err: {e}")
@@ -527,7 +805,7 @@ class MainWindow(QMainWindow):
         """
         Capture the current bucket.  Before computing new values, we
         refresh the intraday cache so that price_at_or_before_bucket()
-        uses up‑to‑date minute data.  This call is synchronous and may
+        uses up-to-date minute data.  This call is synchronous and may
         take a few seconds, but it eliminates stale data between
         buckets.  Any exceptions are logged and surfaced via a
         message box.
@@ -535,45 +813,55 @@ class MainWindow(QMainWindow):
         try:
             _load_intraday_cache()
 
-            idx = self._bucket_index_now()
+            now_dt = now_eastern()
+            hm = (now_dt.hour, now_dt.minute)
+            self._ensure_session(now_dt.date())
+            idx = self._bucket_index_now(hm)
             label = INDEX_TO_LABEL.get(idx) if idx is not None else None
             if label is None:
                 self.statusBar().showMessage("Pre-market — will capture starting 9:31 AM", 4000)
                 return
 
-            col = 1 + LABEL_TO_INDEX[label]
-            prev_col = col - 1
+            label_idx = LABEL_TO_INDEX[label]
+            col = 1 + label_idx
 
             for r, tk in enumerate(TICKERS):
-                h, m = BUCKETS[LABEL_TO_INDEX[label]][1]
-                price = price_at_or_before_bucket(tk, h, m)
-
-                base = None
-                if prev_col >= 1:
-                    prev_it = self.table.item(r, prev_col)
-                    if prev_it and prev_it.text():
-                        base = parse_price_pct(prev_it.text())[0]
-                if base is None:
-                    base = last_close(tk)
-
+                h, m = BUCKETS[label_idx][1]
+                price = price_at_or_before_bucket(tk, self.session_date, h, m)
+                self._ensure_prev_close(tk)
+                base = self._base_for(tk, label)
                 _txt, pct, item = self._render_cell(price, base)
                 self.table.setItem(r, col, item)
-                if isinstance(pct, (int, float)):
-                    self.last_pct[tk] = pct
+                self.bucket_prices[tk][label] = price if isinstance(price, (int, float)) else None
 
-            self.statusBar().showMessage(f"Captured {label}")
-            self._export_excel_grid_and_bucket(label)
+            self._maybe_export(label)
+            self.statusBar().showMessage(f"Captured {label} @ {format_et(now_dt)}", 4000)
 
         except Exception:
             log("refresh_now fatal:\n" + traceback.format_exc())
             QMessageBox.warning(self, APP_NAME, "Refresh failed. See tracker.log for details.")
 
     # ---------- Excel export (Grid + bucket) ----------
+    def _snapshot_for_label(self, label: str) -> Tuple[Optional[float], ...]:
+        snap: List[Optional[float]] = []
+        for tk in TICKERS:
+            val = self.bucket_prices.get(tk, {}).get(label)
+            snap.append(val if isinstance(val, (int, float)) else None)
+        return tuple(snap)
+
+    def _maybe_export(self, label: str, force: bool = False) -> None:
+        if pd is None or openpyxl is None:
+            return
+        snap = self._snapshot_for_label(label)
+        if force or self._exported_states.get(label) != snap:
+            self._export_excel_grid_and_bucket(label)
+            self._exported_states[label] = snap
+
     def _excel_color_for(self, pct: Optional[float]) -> str:
         if isinstance(pct,(int,float)):
-            if pct > 0:  return "107C10"
-            if pct < 0:  return "B42020"
-        return "505050"
+            if pct > 0:  return "22C55E"
+            if pct < 0:  return "F87171"
+        return "94A3B8"
 
     def _export_excel_grid_and_bucket(self, label: str) -> None:
         if pd is None or openpyxl is None:
@@ -594,13 +882,17 @@ class MainWindow(QMainWindow):
                 rows.append(row)
             df_grid = pd.DataFrame(rows, columns=headers)
 
-            col_idx = 1 + LABEL_TO_INDEX[label]
             prices: List[Optional[float]] = []
             pcts: List[Optional[float]] = []
-            for r in range(len(TICKERS)):
-                it = self.table.item(r, col_idx)
-                px, pc = parse_price_pct(it.text() if it else "")
-                prices.append(px); pcts.append(pc)
+            for tk in TICKERS:
+                self._ensure_prev_close(tk)
+                px = self.bucket_prices.get(tk, {}).get(label)
+                base = self._base_for(tk, label)
+                pct_val: Optional[float] = None
+                if isinstance(px, (int, float)) and isinstance(base, (int, float)) and base:
+                    pct_val = ((px / base) - 1.0) * 100.0
+                prices.append(px if isinstance(px, (int, float)) else None)
+                pcts.append(pct_val)
             df_bucket = pd.DataFrame({"price": prices, "pct": pcts},
                                      index=[f"{i+1}. {t}" for i,t in enumerate(TICKERS)])
 
@@ -687,17 +979,17 @@ class MainWindow(QMainWindow):
         html = """
         <h2>Feature Explanations</h2>
         <ol>
-          <li><b>Mini “Dow Dashboard” with Market Mood</b> — breadth, best/worst, and concentration for quick context.</li>
-          <li><b>Auto News Ping for Movers</b> — tray alert when a component leads the move; shows headline if available.</li>
-          <li><b>Chart Sparkline View</b> — tiny trend spark from 1-minute data for slope at a glance.</li>
-          <li><b>Replay Mode</b> — scrub the day from saved buckets for post-mortems.</li>
-          <li><b>Morning Resume Summary</b> — yesterday’s best/worst at start for context.</li>
-          <li><b>Historical Echo Mode</b> — on ±2% move, surface the closest analog and next-day result.</li>
-          <li><b>Dow “Concentration” Meter</b> — share of the move from the top five names.</li>
-          <li><b>Custom Market Sounds</b> — tone when |move| ≥ your threshold.</li>
-          <li><b>Candle Ghosts</b> — print `ghost:&lt;yday close&gt;` as a quick anchor.</li>
-          <li><b>Daily Confidence Meter</b> — smoothed advancers/30 gauge.</li>
-          <li><b>“Dow DNA” Export</b> — weekly correlations and realized vol to CSV.</li>
+          <li><b>Mini \"Dow Dashboard\" Pulse</b> — bright banner showing advancers vs decliners, top movers, and a quick market mood dial.</li>
+          <li><b>Auto News Ping for Movers</b> — tray alert that pairs the lead mover with its freshest Yahoo headline.</li>
+          <li><b>Chart Sparkline View</b> — Unicode sparkline using 1-minute closes so you can see the slope without leaving the grid.</li>
+          <li><b>Replay Mode</b> — scrub saved captures like a DVR to replay the session or clip highlights.</li>
+          <li><b>Morning Resume Summary</b> — sunrise toast recapping yesterday's leaders, laggards, and index finish.</li>
+          <li><b>Historical Echo Mode</b> — on ±2% swings, surface the closest historical analog and what happened next day.</li>
+          <li><b>Dow \"Concentration\" Meter</b> — gauge showing how much of the move is driven by the top five components.</li>
+          <li><b>Custom Market Sounds</b> — playful chimes whenever a component crosses the percentage threshold you set.</li>
+          <li><b>Candle Ghosts</b> — overlay a ghost line at yesterday's close so you instantly know where price is anchored.</li>
+          <li><b>Daily Confidence Meter</b> — animated breadth bar tracking advancers out of 30 as the session unfolds.</li>
+          <li><b>\"Dow DNA\" Export</b> — weekly CSV drop full of correlations, realized volatility, and stat blocks.</li>
         </ol>
         """
         dlg = QDialog(self); dlg.setWindowTitle("Feature Explainer"); dlg.setWindowIcon(self._icon())
@@ -719,12 +1011,12 @@ class MainWindow(QMainWindow):
         <h2>DOW 30 Tracker — Quick Tour</h2>
         <ul>
           <li><b>Toolbar:</b> Refresh · Browse Excels · Auto-Start toggles · view options (Show Times, Show %, Arrows, Stripe Rows) · Features · this guide.</li>
-          <li><b>Table:</b> Tickers on the left (1–32); columns are market-hour buckets. Each cell = price vs previous bucket (9:31 compares to yesterday’s close).</li>
-          <li><b>Status bar:</b> Messages like “Captured 3:00 PM”.</li>
+          <li><b>Table:</b> Tickers on the left (1–32); columns are market-hour buckets. Each cell = price vs the previous bucket (9:31 compares to the prior session's 4:00 PM capture, falling back to the latest close when needed).</li>
+          <li><b>Status bar:</b> Messages like "Captured 3:00 PM".</li>
           <li><b>System tray:</b> Close hides to tray; launching app again brings this window forward.</li>
           <li><b>Excel:</b> Every capture writes to <code>Sheet__MM_DD_YYYY.xlsx</code> in your data folder (Grid + one sheet per bucket).</li>
         </ul>
-        <p>Use “Set Data Folder…” to choose where workbooks are saved. Remembered in <code>settings.json</code>.</p>
+        <p>Use "Set Data Folder…" to choose where workbooks are saved. Remembered in <code>settings.json</code>.</p>
         """
         te = QTextEdit(); te.setReadOnly(True); te.setHtml(html)
         layout.addWidget(te)
@@ -777,6 +1069,7 @@ class MainWindow(QMainWindow):
 
 # -------- main --------
 def main() -> None:
+    ensure_single_instance()
     sock = start_primary_socket()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME); app.setQuitOnLastWindowClosed(False)

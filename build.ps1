@@ -24,17 +24,16 @@ if (-not (Test-Path $MainPy)) {
     throw "Missing DOW30_Tracker_LIVE.py in $ProjectDir"
 }
 if (-not (Test-Path $Assets)) { New-Item -ItemType Directory -Force -Path $Assets | Out-Null }
-if (-not (Test-Path (Join-Path $Assets "dow.ico"))) { Write-Host "WARNING: assets\dow.ico missing (EXE will use default icon)" -ForegroundColor Yellow }
 if (-not (Test-Path $Data))   { New-Item -ItemType Directory -Force -Path $Data   | Out-Null }
 
 # Optional: refresh deps (use your active venv if any)
 if ($InstallDeps) {
     Write-Host ">> Installing/Upgrading build dependencies..." -ForegroundColor Cyan
-    python -V | Out-Null
-    python -m pip install --upgrade pip
-    pip install --upgrade pyinstaller PyQt5 pandas yfinance openpyxl
+    & python -V | Out-Null
+    & python -m pip install --upgrade pip
+    & python -m pip install --upgrade pyinstaller PyQt5 pandas yfinance openpyxl
     # Quiet some older hook weirdness
-    pip install --upgrade typing_extensions
+    & python -m pip install --upgrade typing_extensions
 }
 
 # --- FULL CLEAN ---
@@ -47,6 +46,17 @@ Get-ChildItem $ProjectDir -Recurse -Directory -Filter "__pycache__" -ErrorAction
 # Ensure 'data' exists so users have a predictable default folder
 if (-not (Test-Path $Data))   { New-Item -ItemType Directory -Force -Path $Data | Out-Null }
 
+$MainPy = (Resolve-Path -LiteralPath $MainPy).Path
+$AssetsResolved = (Resolve-Path -LiteralPath $Assets).Path
+$DataResolved = (Resolve-Path -LiteralPath $Data).Path
+$IconPath = Join-Path $AssetsResolved "dow.ico"
+$IconResolved = $null
+try { $IconResolved = (Resolve-Path -LiteralPath $IconPath).Path } catch { }
+if (-not $IconResolved) {
+    Write-Host "WARNING: assets\dow.ico missing (EXE will use default icon)" -ForegroundColor Yellow
+    $IconResolved = $IconPath
+}
+
 # Kill running copies so we can overwrite EXE safely
 Write-Host ">> Stopping any running instances..." -ForegroundColor Cyan
 $null = cmd /c "taskkill /IM DOW30_Tracker_LIVE.exe /F 2>nul" 
@@ -58,26 +68,31 @@ $null = cmd /c "taskkill /IM DOW30_Tracker_Console_LIVE.exe /F 2>nul"
 $CommonArgs = @(
   "--clean",
   "--noconfirm",
-  "--icon", "assets\dow.ico",
-  "--add-data", "assets;assets",
-  "--add-data", "data;data"
+  "--icon", $IconResolved,
+  "--add-data", "${AssetsResolved};assets",
+  "--add-data", "${DataResolved};data",
+  "--workpath", (Join-Path $ProjectDir "build"),
+  "--distpath", (Join-Path $ProjectDir "dist"),
+  "--specpath", $ProjectDir
 )
+
+function Invoke-PyInstaller {
+    param(
+        [string[]]$Arguments
+    )
+    Write-Host ("   python -m PyInstaller {0}" -f ($Arguments -join ' ')) -ForegroundColor DarkGray
+    & python -m PyInstaller @Arguments
+}
 
 # GUI build
 Write-Host ">> Building windowed EXE..." -ForegroundColor Cyan
-$GuiCmd = @(
-  $CommonArgs +
-  @("--onefile", "--windowed", "--name", "DOW30_Tracker_LIVE", "DOW30_Tracker_LIVE.py")
-)
-pyinstaller $GuiCmd
+$GuiCmd = $CommonArgs + @("--onefile", "--windowed", "--name", "DOW30_Tracker_LIVE", $MainPy)
+Invoke-PyInstaller -Arguments $GuiCmd
 
 # Console build
 Write-Host ">> Building console EXE..." -ForegroundColor Cyan
-$ConCmd = @(
-  $CommonArgs +
-  @("--onefile", "--console", "--name", "DOW30_Tracker_Console_LIVE", "DOW30_Tracker_LIVE.py")
-)
-pyinstaller $ConCmd
+$ConCmd = $CommonArgs + @("--onefile", "--console", "--name", "DOW30_Tracker_Console_LIVE", $MainPy)
+Invoke-PyInstaller -Arguments $ConCmd
 
 # Verify outputs
 if (-not (Test-Path "dist\DOW30_Tracker_LIVE.exe")) { throw "GUI EXE missing" }
