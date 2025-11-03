@@ -1,0 +1,127 @@
+﻿diff --git a/DOW30_Tracker_LIVE.py b/DOW30_Tracker_LIVE.py
+index 3924f267def4e89cd8f457cdc5caf55b0279eedf..60dd7d9974d84602a0a425323cf2f94ba4f97cd5 100644
+--- a/DOW30_Tracker_LIVE.py
++++ b/DOW30_Tracker_LIVE.py
+@@ -1,77 +1,83 @@
+ # -*- coding: utf-8 -*-
+ from __future__ import annotations
+ """
+ DOW 30 Tracker  market-hours only (no after-hours)
+ - Single instance (second run focuses the first)
+ - Backfill full day on launch; live capture during session
+ - Buckets: 9:31 AM, 10:00 AM, 11:00 AM, 12 NOON, 1:00 PM, 2:00 PM, 3:00 PM, 4:00 PM
+ - Arrows / % / colors compare each bucket to the immediately prior bucket (9:31 uses the prior session's 4:00 PM capture, then
+   falls back to the latest close if needed)
+ - Excel export: daily file "Sheet__MM_DD_YYYY.xlsx"
+   * Grid sheet mirrors the UI (tickers + all buckets)
+   * One sheet per bucket with numeric `price` and `pct` columns
+ - User-selectable data folder (remembered in settings.json)
+ """
+ 
+ import os, sys, json, socket, threading, traceback, re, atexit, io
+ from pathlib import Path
+-from datetime import datetime, date, timedelta
++from datetime import datetime, date, timedelta, time
+ from typing import Any, Dict, Optional, List, Tuple, Callable, Set, cast
++from concurrent.futures import ThreadPoolExecutor, Future
+@@ -210,50 +216,52 @@ def default_data_dir() -> Path:
+         for env_key in ("OneDriveCommercial", "OneDriveConsumer", "ONEDRIVE", "OneDrive"):
+             onedrive = os.environ.get(env_key)
+             if onedrive:
+                 doc_candidates.insert(0, Path(onedrive) / "Documents" / "Saved DOW Sheets")
+     for candidate in doc_candidates:
+         try:
+             candidate.mkdir(parents=True, exist_ok=True)
+             return candidate
+         except Exception:
+             continue
+     fallback = STATE_DIR / "Saved"
+     fallback.mkdir(parents=True, exist_ok=True)
+     return fallback
+@@ -283,57 +291,58 @@ def _load_bucket_from_workbook(path: Path, bucket_label: str) -> Dict[str, Optio
+         for row_idx, tk in enumerate(TICKERS, start=2):
+             val = ws.cell(row=row_idx, column=2).value
+             result[tk] = float(val) if isinstance(val, (int, float)) else None
+         wb.close()
+         _PRIOR_BUCKET_CACHE[cache_key] = dict(result)
+         return result
+     except Exception as e:
+         log(f"load workbook bucket err: {e}")
+         return {}
+@@ -499,111 +508,295 @@ def now_eastern() -> datetime:
+     if ZoneInfo is not None:
+         try:
+             return datetime.now(tz=ZoneInfo("America/New_York"))
+         except Exception:
+             pass
+     try:
+         import pytz  # type: ignore
+@@ -1117,50 +1310,55 @@ class ReplayDialog(QDialog):
+         flats = len(rows) - adv - dec
+         summary = f"Advancers {adv}  Decliners {dec}  Flat {flats}"
+         if isinstance(top_pct, (int, float)) and top_ticker:
+             summary += f"  Top mover {top_ticker} {top_pct:+.2f}%"
+         self.summary_label.setText(summary)
+ # -------- Main Window --------
+ class MainWindow(QMainWindow):
+     def __init__(self):
+         super().__init__()
+         self.setWindowTitle(APP_NAME); self.setWindowIcon(self._icon()); self.resize(1400, 860)
+@@ -1268,100 +1466,103 @@ class MainWindow(QMainWindow):
+             "Last capture: --",
+             "Breadth: --",
+             "Top mover: --",
+             "Next bucket: --",
+             0,
+             len(BUCKETS),
+             DATA_DIR,
+         )
+         self._apply_feature_visibility()
+@@ -1743,214 +1944,358 @@ class MainWindow(QMainWindow):
+             if capture_dt is not None:
+                 time_text = format_et(capture_dt)
+                 last_capture = f"Last capture: {label}  {time_text}"
+             else:
+                 last_capture = f"Last capture: {label}"
+         else:
+             last_capture = "Last capture: --"
+@@ -2158,81 +2503,101 @@ class MainWindow(QMainWindow):
+         dlg.setWindowTitle("Where the hell is the thing?")
+         dlg.setWindowIcon(self._icon())
+         layout = QVBoxLayout(dlg)
+@@
+-# -------- main --------
++def _atexit_flush() -> None:
++    try:
++        if ACTIVE_WINDOW is not None:
++            ACTIVE_WINDOW._finalize_exports()
++    except Exception as exc:
++        log(f"atexit finalize err: {exc}")
++
++
++atexit.register(_atexit_flush)
++
++
+ def main() -> None:
+     ensure_single_instance()
+     sock = start_primary_socket()
+     app = QApplication(sys.argv)
+-    app.setApplicationName(APP_NAME); app.setQuitOnLastWindowClosed(False)
+-    w = MainWindow()
+-    socket_listener(sock, on_show=w.show_main)
+-    w.show()
+-    sys.exit(app.exec_())
++    app.setApplicationName(APP_NAME); app.setQuitOnLastWindowClosed(False)
++    w = MainWindow()
++    global ACTIVE_WINDOW
++    ACTIVE_WINDOW = w
++    socket_listener(sock, on_show=w.show_main)
++    w.show()
++    sys.exit(app.exec_())
+ 
+ if __name__ == "__main__":
+     try:
+         main()
+     except Exception as e:
+         log(f"FATAL: {e}\n{traceback.format_exc()}")
+         raise
