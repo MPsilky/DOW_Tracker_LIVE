@@ -1,4 +1,4 @@
-﻿# DOW 30 Tracker — One-Click Builder (GUI + Console)
+# DOW 30 Tracker — One-Click Builder (GUI + Console)
 # Run in Administrator PowerShell inside the project folder.
 # Supports optional flags: -InstallDeps, -MakeInstaller, -Run
 
@@ -19,7 +19,7 @@ Write-Host ">> Project: $ProjectDir" -ForegroundColor Cyan
 # App metadata (update version when shipping a new installer)
 $AppName = "DOW 30 Tracker"
 $AppExeName = "DOW30_Tracker_LIVE.exe"
-$AppVersion = "1.5.0"
+$AppVersion = "1.4.0"
 
 # Paths
 $Assets = Join-Path $ProjectDir "assets"
@@ -37,7 +37,7 @@ if ($InstallDeps) {
     Write-Host ">> Installing/Upgrading build dependencies..." -ForegroundColor Cyan
     & python -V | Out-Null
     & python -m pip install --upgrade pip
-    & python -m pip install --upgrade pyinstaller PyQt5 pandas yfinance openpyxl requests
+    & python -m pip install --upgrade pyinstaller PyQt5 pandas yfinance openpyxl
     # Quiet some older hook weirdness
     & python -m pip install --upgrade typing_extensions
 }
@@ -136,7 +136,3 @@ if ($Run) {
     Write-Host ">> Launching GUI build..." -ForegroundColor Cyan
     Start-Process -FilePath $GuiExe
 }
-
-# ensure intraday cache exists for on-disk minute data
-$CacheDir = Join-Path $Data "intraday_cache"
-if (-not (Test-Path $CacheDir)) { New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null }

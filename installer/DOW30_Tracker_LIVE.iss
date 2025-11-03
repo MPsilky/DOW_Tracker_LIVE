@@ -1,4 +1,4 @@
-﻿#define MyAppName "{{APP_NAME}}"
+#define MyAppName "{{APP_NAME}}"
 #define MyAppVersion "{{APP_VERSION}}"
 #define MyAppPublisher "DOW Tracker"
 #define MyAppExeName "{{APP_EXE}}"
@@ -17,7 +17,7 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableDirPage=no
 DisableProgramGroupPage=yes
-LicenseFile={#SourceRoot}\README.md
+LicenseFile={#SourceRoot}\README.txt
 OutputDir={#SourceRoot}\dist
 OutputBaseFilename=DOW30_Tracker_LIVE-Installer
 Compression=lzma
@@ -38,8 +38,7 @@ Name: "startmenuicon"; Description: "Add Start Menu shortcut"; GroupDescription:
 Name: "taskbaricon"; Description: "Pin to the taskbar (if supported)"; GroupDescription: "Shortcut options:"
 
 [Files]
-
-Source: "{#SourceRoot}\dist\DOW30_Tracker_Console_LIVE.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceRoot}\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceRoot}\data\*"; DestDir: "{app}\data"; Flags: ignoreversion recursesubdirs createallsubdirs
 
@@ -58,5 +57,3 @@ Filename: "{cmd}"; Parameters: "/c powershell -NoProfile -ExecutionPolicy Bypass
 
 [UninstallDelete]
 Type: files; Name: "{userappdata}\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\{#MyAppName}.lnk"
-
-Source: "{#SourceRoot}\samples\*"; DestDir: "{app}\samples"; Flags: ignoreversion recursesubdirs createallsubdirs
