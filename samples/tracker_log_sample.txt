@@ -1,0 +1,9 @@
+[2024-06-21 09:31:02] launch: scheduling capture ['9:31 AM']
+[2024-06-21 09:31:03] intraday provider yfinance filled 30 tickers (remaining 2)
+[2024-06-21 09:31:04] intraday provider alphavantage filled 2 tickers (remaining 0)
+[2024-06-21 09:31:04] intraday cache source=persisted / yfinance / alphavantage stale=0 missing=0
+[2024-06-21 09:31:05] capture worker: 9:31 AM completed (source yfinance / alphavantage)
+[2024-06-21 10:00:01] timer tick: queued ['10:00 AM']
+[2024-06-21 10:00:04] capture worker: 10:00 AM completed (stale 1)
+[2024-06-21 10:00:05] intraday provider twelvedata filled 1 tickers (remaining 0)
+[2024-06-21 16:00:05] capture worker: 4:00 PM completed (forced export)
