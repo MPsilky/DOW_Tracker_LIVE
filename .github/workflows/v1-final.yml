@@ -14,16 +14,17 @@ jobs:
     runs-on: windows-latest
     env:
       ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
-      TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
-      IEX_CLOUD_API_KEY: ${{ secrets.IEX_CLOUD_API_KEY }}
-      FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-      POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+      TWELVEDATA_API_KEY:   ${{ secrets.TWELVEDATA_API_KEY }}
+      IEX_CLOUD_API_KEY:    ${{ secrets.IEX_CLOUD_API_KEY }}
+      FINNHUB_API_KEY:      ${{ secrets.FINNHUB_API_KEY }}
+      POLYGON_API_KEY:      ${{ secrets.POLYGON_API_KEY }}
+
     steps:
       - name: Check out
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -38,18 +39,20 @@ jobs:
       - name: Build executables and installer script
         shell: pwsh
         run: |
-          Set-ExecutionPolicy -Scope Process Bypass
+          Set-ExecutionPolicy -Scope Process Bypass -Force
           .\build.ps1 -MakeInstaller
 
       - name: Upload dist artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: dow30-tracker-dist
           path: |
             dist\*.exe
             dist\*.iss
+
       - name: Upload log sample
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: dow30-tracker-log-sample
           path: samples\tracker_log_sample.txt
+          if-no-files-found: ignore
