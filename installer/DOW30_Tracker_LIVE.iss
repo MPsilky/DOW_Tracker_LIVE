@@ -17,7 +17,7 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableDirPage=no
 DisableProgramGroupPage=yes
-LicenseFile={#SourceRoot}\README.txt
+LicenseFile={#SourceRoot}\README.md
 OutputDir={#SourceRoot}\dist
 OutputBaseFilename=DOW30_Tracker_LIVE-Installer
 Compression=lzma
@@ -39,8 +39,10 @@ Name: "taskbaricon"; Description: "Pin to the taskbar (if supported)"; GroupDesc
 
 [Files]
 Source: "{#SourceRoot}\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceRoot}\dist\DOW30_Tracker_Console_LIVE.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceRoot}\data\*"; DestDir: "{app}\data"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceRoot}\samples\*"; DestDir: "{app}\samples"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Dirs]
 Name: "{userappdata}\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"; Flags: uninsneveruninstall
