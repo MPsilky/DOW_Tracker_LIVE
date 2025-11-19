@@ -19,7 +19,7 @@ Write-Host ">> Project: $ProjectDir" -ForegroundColor Cyan
 # App metadata (update version when shipping a new installer)
 $AppName = "DOW 30 Tracker"
 $AppExeName = "DOW30_Tracker_LIVE.exe"
-$AppVersion = "1.4.0"
+$AppVersion = "1.5.0"
 
 # Paths
 $Assets = Join-Path $ProjectDir "assets"
@@ -37,7 +37,7 @@ if ($InstallDeps) {
     Write-Host ">> Installing/Upgrading build dependencies..." -ForegroundColor Cyan
     & python -V | Out-Null
     & python -m pip install --upgrade pip
-    & python -m pip install --upgrade pyinstaller PyQt5 pandas yfinance openpyxl
+    & python -m pip install --upgrade pyinstaller PyQt5 pandas yfinance openpyxl requests
     # Quiet some older hook weirdness
     & python -m pip install --upgrade typing_extensions
 }
@@ -51,6 +51,8 @@ Get-ChildItem $ProjectDir -Recurse -Directory -Filter "__pycache__" -ErrorAction
 
 # Ensure 'data' exists so users have a predictable default folder
 if (-not (Test-Path $Data))   { New-Item -ItemType Directory -Force -Path $Data | Out-Null }
+$CacheDir = Join-Path $Data "intraday_cache"
+if (-not (Test-Path $CacheDir)) { New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null }
 
 $MainPy = (Resolve-Path -LiteralPath $MainPy).Path
 $AssetsResolved = (Resolve-Path -LiteralPath $Assets).Path
