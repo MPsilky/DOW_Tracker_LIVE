@@ -13,10 +13,11 @@ DOW 30 Tracker — market-hours only (no after-hours)
 - User-selectable data folder (remembered in settings.json)
 """
 
-import os, sys, json, socket, threading, traceback, re, atexit, io
+import os, sys, json, socket, threading, traceback, re, atexit, io, asyncio
 from pathlib import Path
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time, timezone, tzinfo
 from typing import Any, Dict, Optional, List, Tuple, Callable, Set, cast
+from concurrent.futures import ThreadPoolExecutor, Future
 
 try:
     from zoneinfo import ZoneInfo  # type: ignore
@@ -32,6 +33,10 @@ except Exception:
     yf = None   # type: ignore[assignment]
     pd = None   # type: ignore[assignment]
     np = None   # type: ignore[assignment]
+try:
+    import requests  # type: ignore
+except Exception:
+    requests = None  # type: ignore[assignment]
 try:
     import openpyxl  # noqa: F401
     from openpyxl import load_workbook  # type: ignore
@@ -50,6 +55,7 @@ from PyQt5.QtCore import (
     QSequentialAnimationGroup,
     pyqtProperty,
     pyqtSlot,
+    pyqtSignal,
     QPoint,
     QPointF,
     QRectF,
@@ -232,6 +238,8 @@ def get_data_dir() -> Path:
 DATA_DIR = get_data_dir()
 LOG_PATH = DATA_DIR / "tracker.log"
 FEATURES_JSON = DATA_DIR / "features.json"
+INTRADAY_CACHE_DIR = DATA_DIR / "intraday_cache"
+INTRADAY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 _WORKBOOK_RE = re.compile(r"Sheet__(\d{2})_(\d{2})_(\d{4})\.xlsx$", re.IGNORECASE)
 _PRIOR_BUCKET_CACHE: Dict[Tuple[str, str], Dict[str, Optional[float]]]
@@ -308,6 +316,7 @@ def clear_prior_bucket_cache() -> None:
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(f"[{ts}] {msg}\n")
     except Exception:
@@ -495,6 +504,20 @@ def _ny_tz() -> str:
     return "America/New_York"
 
 
+def _ny_zone() -> Optional[tzinfo]:
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo("America/New_York")
+        except Exception:
+            pass
+    try:
+        import pytz  # type: ignore
+
+        return pytz.timezone("US/Eastern")
+    except Exception:
+        return None
+
+
 def now_eastern() -> datetime:
     if ZoneInfo is not None:
         try:
@@ -509,6 +532,13 @@ def now_eastern() -> datetime:
         return datetime.now()
 
 
+def _session_bounds(session_day: date) -> Tuple[datetime, datetime]:
+    tzinfo = _ny_zone() or timezone.utc
+    start = datetime(session_day.year, session_day.month, session_day.day, 9, 30, tzinfo=tzinfo)
+    end = datetime(session_day.year, session_day.month, session_day.day, 16, 0, tzinfo=tzinfo)
+    return start, end
+
+
 def format_et(dt: datetime) -> str:
     try:
         text = dt.strftime("%I:%M %p")
@@ -521,104 +551,644 @@ def format_et(dt: datetime) -> str:
 # Intraday cache
 _intraday_cache: Dict[str, "pd.Series"] = {}
 _intraday_cache_day: Optional[date] = None
+_CACHE_BACKOFF_UNTIL: Optional[datetime] = None
+_CACHE_STALE_TICKERS: Set[str] = set()
+_CACHE_SOURCE: str = "uninitialized"
+ACTIVE_WINDOW: Optional["MainWindow"] = None
 
-def _load_intraday_cache(target_day: Optional[date] = None) -> None:
-    """
-    Populate `_intraday_cache` with 1-minute close price series for all
-    tickers for the current trading day.  A single call to
-    `yfinance.download` fetches data efficiently.  If yfinance or
-    pandas are unavailable, the function quietly returns.
-    """
-    global _intraday_cache, _intraday_cache_day
-    if yf is None or pd is None:
-        return
-    try:
-        day = target_day or now_eastern().date()
-        df = yf.download(
-            tickers=" ".join(TICKERS),
-            period="1d",
-            interval="1m",
-            prepost=False,
-            group_by="ticker",
-            auto_adjust=False,
-            progress=False,
-            threads=True,
-        )
-        new_cache: Dict[str, "pd.Series"] = {}
-        for tk in TICKERS:
-            s: Optional[pd.Series] = None
-            if isinstance(df, dict):
-                sub = df.get(tk)
-                if sub is not None and "Close" in sub:
-                    s = sub["Close"]
-            elif tk in getattr(df, "columns", []) or (
-                isinstance(getattr(df, "columns", None), pd.MultiIndex)
-                and tk in df.columns.get_level_values(0)
-            ):
-                try:
-                    sub_df = df.xs(tk, level=0) if isinstance(df.columns, pd.MultiIndex) else df[tk]  # type: ignore[index]
-                    s = sub_df["Close"]  # type: ignore[index]
-                except Exception:
-                    s = None
-            if s is not None and not s.empty:
-                if getattr(s.index, "tz", None) is None:
-                    s = s.tz_localize(_ny_tz())  # type: ignore[attr-defined]
-                else:
-                    s = s.tz_convert(_ny_tz())   # type: ignore[attr-defined]
-                try:
-                    s = s.dropna()
-                    s = s.loc[str(day)]
-                except Exception:
-                    s = pd.Series(dtype="float64") if pd is not None else None  # type: ignore[assignment]
+
+class YFinanceProvider:
+    name = "yfinance"
+
+    def available(self) -> bool:
+        return yf is not None and pd is not None
+
+    def fetch(self, target_day: date, tickers: List[str]) -> Dict[str, "pd.Series"]:
+        cache: Dict[str, "pd.Series"] = {}
+        if not self.available() or not tickers:
+            return cache
+        try:
+            df = yf.download(
+                tickers=" ".join(tickers),
+                period="1d",
+                interval="1m",
+                prepost=False,
+                group_by="ticker",
+                auto_adjust=False,
+                progress=False,
+                threads=True,
+            )
+            for tk in tickers:
+                s: Optional[pd.Series] = None
+                if isinstance(df, dict):
+                    sub = df.get(tk)
+                    if sub is not None and "Close" in sub:
+                        s = sub["Close"]
+                elif tk in getattr(df, "columns", []) or (
+                    isinstance(getattr(df, "columns", None), pd.MultiIndex)
+                    and tk in df.columns.get_level_values(0)
+                ):
+                    try:
+                        sub_df = df.xs(tk, level=0) if isinstance(df.columns, pd.MultiIndex) else df[tk]  # type: ignore[index]
+                        s = sub_df["Close"]  # type: ignore[index]
+                    except Exception:
+                        s = None
                 if s is not None and not getattr(s, "empty", True):
-                    new_cache[tk] = s  # type: ignore[assignment]
-        if new_cache:
-            _intraday_cache = new_cache
-            _intraday_cache_day = day
+                    cache[tk] = s
+        except Exception as exc:
+            log(f"yfinance bulk err: {exc}")
+        return cache
+
+
+class AlphaVantageClient:
+    """Minimal Alpha Vantage intraday helper used as a fallback feed."""
+
+    name = "alphavantage"
+
+    def __init__(self, api_key: Optional[str]) -> None:
+        key = (api_key or "").strip() or None
+        self.api_key = key
+        self.session = requests.Session() if (requests is not None and key) else None
+        self.max_batch = 5  # respect public tier limits
+
+    def available(self) -> bool:
+        return self.session is not None and self.api_key is not None and pd is not None
+
+    def fetch_series(self, ticker: str, target_day: date) -> Optional["pd.Series"]:
+        if not self.available():
+            return None
+        assert self.session is not None and self.api_key is not None
+        try:
+            params = {
+                "function": "TIME_SERIES_INTRADAY",
+                "symbol": ticker,
+                "interval": "1min",
+                "outputsize": "full",
+                "apikey": self.api_key,
+            }
+            resp = self.session.get("https://www.alphavantage.co/query", params=params, timeout=30)
+            resp.raise_for_status()
+            payload = resp.json()
+            key = "Time Series (1min)"
+            block = payload.get(key)
+            if not isinstance(block, dict):
+                return None
+            rows: List[Tuple[datetime, float]] = []
+            for stamp, row in block.items():
+                try:
+                    dt = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                if dt.date() != target_day:
+                    continue
+                close_val: Optional[str] = None
+                if isinstance(row, dict):
+                    close_val = cast(Optional[str], row.get("4. close"))
+                try:
+                    close = float(close_val) if close_val is not None else None
+                except Exception:
+                    close = None
+                if close is None:
+                    continue
+                rows.append((dt, close))
+            if not rows:
+                return None
+            rows.sort(key=lambda item: item[0])
+            idx = pd.DatetimeIndex([dt for dt, _ in rows])
+            idx = idx.tz_localize(_ny_tz())
+            series = pd.Series([val for _, val in rows], index=idx, dtype="float64")
+            return series.dropna()
+        except Exception as exc:
+            log(f"alpha vantage fetch {ticker} err: {exc}")
+            return None
+
+    def fetch(self, target_day: date, tickers: List[str]) -> Dict[str, "pd.Series"]:
+        cache: Dict[str, "pd.Series"] = {}
+        if not self.available():
+            return cache
+        for idx, ticker in enumerate(tickers):
+            if idx >= self.max_batch:
+                break
+            series = self.fetch_series(ticker, target_day)
+            if series is not None and not getattr(series, "empty", True):
+                cache[ticker] = series
+        return cache
+
+
+class TwelveDataClient:
+    name = "twelvedata"
+
+    def __init__(self, api_key: Optional[str]) -> None:
+        key = (api_key or "").strip() or None
+        self.api_key = key
+        self.session = requests.Session() if (requests is not None and key) else None
+        self.max_batch = 8
+
+    def available(self) -> bool:
+        return self.session is not None and self.api_key is not None and pd is not None
+
+    def fetch_series(self, ticker: str, target_day: date) -> Optional["pd.Series"]:
+        if not self.available():
+            return None
+        assert self.session is not None and self.api_key is not None
+        try:
+            params = {
+                "symbol": ticker,
+                "interval": "1min",
+                "outputsize": 390,
+                "timezone": _ny_tz(),
+                "apikey": self.api_key,
+            }
+            resp = self.session.get("https://api.twelvedata.com/time_series", params=params, timeout=30)
+            resp.raise_for_status()
+            payload = resp.json()
+            if isinstance(payload, dict) and payload.get("status") not in (None, "ok"):
+                return None
+            values = payload.get("values") if isinstance(payload, dict) else None
+            if not isinstance(values, list):
+                return None
+            rows: List[Tuple[datetime, float]] = []
+            for row in values:
+                if not isinstance(row, dict):
+                    continue
+                stamp = row.get("datetime")
+                close_val = row.get("close")
+                if not isinstance(stamp, str):
+                    continue
+                try:
+                    dt = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                if dt.date() != target_day:
+                    continue
+                try:
+                    close = float(close_val) if close_val is not None else None
+                except Exception:
+                    close = None
+                if close is None:
+                    continue
+                rows.append((dt, close))
+            if not rows:
+                return None
+            rows.sort(key=lambda item: item[0])
+            idx = pd.DatetimeIndex([dt for dt, _ in rows], tz=_ny_tz())
+            series = pd.Series([val for _, val in rows], index=idx, dtype="float64")
+            return series.dropna()
+        except Exception as exc:
+            log(f"twelvedata fetch {ticker} err: {exc}")
+            return None
+
+    def fetch(self, target_day: date, tickers: List[str]) -> Dict[str, "pd.Series"]:
+        cache: Dict[str, "pd.Series"] = {}
+        if not self.available():
+            return cache
+        for idx, ticker in enumerate(tickers):
+            if idx >= self.max_batch:
+                break
+            series = self.fetch_series(ticker, target_day)
+            if series is not None and not getattr(series, "empty", True):
+                cache[ticker] = series
+        return cache
+
+
+class IEXCloudClient:
+    name = "iexcloud"
+
+    def __init__(self, api_key: Optional[str]) -> None:
+        key = (api_key or "").strip() or None
+        self.api_key = key
+        self.session = requests.Session() if (requests is not None and key) else None
+        self.max_batch = 10
+
+    def available(self) -> bool:
+        return self.session is not None and self.api_key is not None and pd is not None
+
+    def fetch_series(self, ticker: str, target_day: date) -> Optional["pd.Series"]:
+        if not self.available():
+            return None
+        assert self.session is not None and self.api_key is not None
+        try:
+            url = f"https://cloud.iexapis.com/stable/stock/{ticker}/intraday-prices"
+            params = {
+                "token": self.api_key,
+                "chartLast": 390,
+                "chartIEXWhenNull": "true",
+            }
+            resp = self.session.get(url, params=params, timeout=20)
+            resp.raise_for_status()
+            payload = resp.json()
+            if not isinstance(payload, list):
+                return None
+            rows: List[Tuple[datetime, float]] = []
+            for row in payload:
+                if not isinstance(row, dict):
+                    continue
+                minute = row.get("minute")
+                date_txt = row.get("date")
+                close_val = row.get("close")
+                if close_val in (None, ""):
+                    close_val = row.get("average")
+                if not isinstance(minute, str) or not isinstance(date_txt, str):
+                    continue
+                try:
+                    dt = datetime.strptime(f"{date_txt} {minute}", "%Y-%m-%d %H:%M")
+                except ValueError:
+                    continue
+                if dt.date() != target_day:
+                    continue
+                try:
+                    close = float(close_val) if close_val is not None else None
+                except Exception:
+                    close = None
+                if close is None:
+                    continue
+                rows.append((dt, close))
+            if not rows:
+                return None
+            rows.sort(key=lambda item: item[0])
+            idx = pd.DatetimeIndex([dt for dt, _ in rows], tz=_ny_tz())
+            series = pd.Series([val for _, val in rows], index=idx, dtype="float64")
+            return series.dropna()
+        except Exception as exc:
+            log(f"iex cloud fetch {ticker} err: {exc}")
+            return None
+
+    def fetch(self, target_day: date, tickers: List[str]) -> Dict[str, "pd.Series"]:
+        cache: Dict[str, "pd.Series"] = {}
+        if not self.available():
+            return cache
+        for idx, ticker in enumerate(tickers):
+            if idx >= self.max_batch:
+                break
+            series = self.fetch_series(ticker, target_day)
+            if series is not None and not getattr(series, "empty", True):
+                cache[ticker] = series
+        return cache
+
+
+class FinnhubClient:
+    name = "finnhub"
+
+    def __init__(self, api_key: Optional[str]) -> None:
+        key = (api_key or "").strip() or None
+        self.api_key = key
+        self.session = requests.Session() if (requests is not None and key) else None
+
+    def available(self) -> bool:
+        return self.session is not None and self.api_key is not None and pd is not None
+
+    def fetch_series(self, ticker: str, target_day: date) -> Optional["pd.Series"]:
+        if not self.available():
+            return None
+        assert self.session is not None and self.api_key is not None
+        try:
+            ny_zone = _ny_zone()
+            start_dt, end_dt = _session_bounds(target_day)
+            start_ts = int(start_dt.astimezone(timezone.utc).timestamp())
+            end_ts = int(end_dt.astimezone(timezone.utc).timestamp())
+            params = {
+                "symbol": ticker,
+                "resolution": "1",
+                "from": start_ts,
+                "to": end_ts,
+                "token": self.api_key,
+            }
+            resp = self.session.get("https://finnhub.io/api/v1/stock/candle", params=params, timeout=20)
+            resp.raise_for_status()
+            payload = resp.json()
+            if payload.get("s") != "ok":
+                return None
+            stamps = payload.get("t")
+            closes = payload.get("c")
+            if not isinstance(stamps, list) or not isinstance(closes, list):
+                return None
+            rows: List[Tuple[datetime, float]] = []
+            for stamp, close in zip(stamps, closes):
+                try:
+                    ts = int(stamp)
+                    price = float(close)
+                except Exception:
+                    continue
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                dt = dt.astimezone(ny_zone or dt.tzinfo)
+                if dt.date() != target_day:
+                    continue
+                rows.append((dt, price))
+            if not rows:
+                return None
+            rows.sort(key=lambda item: item[0])
+            idx = pd.DatetimeIndex([dt for dt, _ in rows], tz=_ny_tz())
+            series = pd.Series([val for _, val in rows], index=idx, dtype="float64")
+            return series.dropna()
+        except Exception as exc:
+            log(f"finnhub fetch {ticker} err: {exc}")
+            return None
+
+    def fetch(self, target_day: date, tickers: List[str]) -> Dict[str, "pd.Series"]:
+        cache: Dict[str, "pd.Series"] = {}
+        if not self.available():
+            return cache
+        for ticker in tickers:
+            series = self.fetch_series(ticker, target_day)
+            if series is not None and not getattr(series, "empty", True):
+                cache[ticker] = series
+        return cache
+
+
+class PolygonClient:
+    name = "polygon"
+
+    def __init__(self, api_key: Optional[str]) -> None:
+        key = (api_key or "").strip() or None
+        self.api_key = key
+        self.session = requests.Session() if (requests is not None and key) else None
+
+    def available(self) -> bool:
+        return self.session is not None and self.api_key is not None and pd is not None
+
+    def fetch_series(self, ticker: str, target_day: date) -> Optional["pd.Series"]:
+        if not self.available():
+            return None
+        assert self.session is not None and self.api_key is not None
+        try:
+            ny_zone = _ny_zone()
+            start_dt, end_dt = _session_bounds(target_day)
+            start_utc = start_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            end_utc = end_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{start_utc}/{end_utc}"
+            params = {
+                "adjusted": "true",
+                "sort": "asc",
+                "limit": 5000,
+                "apiKey": self.api_key,
+            }
+            resp = self.session.get(url, params=params, timeout=20)
+            resp.raise_for_status()
+            payload = resp.json()
+            results = payload.get("results") if isinstance(payload, dict) else None
+            if not isinstance(results, list):
+                return None
+            rows: List[Tuple[datetime, float]] = []
+            for row in results:
+                if not isinstance(row, dict):
+                    continue
+                stamp = row.get("t")
+                close_val = row.get("c")
+                try:
+                    ts = int(stamp) / 1000.0
+                    price = float(close_val)
+                except Exception:
+                    continue
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                dt = dt.astimezone(ny_zone or dt.tzinfo)
+                if dt.date() != target_day:
+                    continue
+                rows.append((dt, price))
+            if not rows:
+                return None
+            rows.sort(key=lambda item: item[0])
+            idx = pd.DatetimeIndex([dt for dt, _ in rows], tz=_ny_tz())
+            series = pd.Series([val for _, val in rows], index=idx, dtype="float64")
+            return series.dropna()
+        except Exception as exc:
+            log(f"polygon fetch {ticker} err: {exc}")
+            return None
+
+    def fetch(self, target_day: date, tickers: List[str]) -> Dict[str, "pd.Series"]:
+        cache: Dict[str, "pd.Series"] = {}
+        if not self.available():
+            return cache
+        for ticker in tickers:
+            series = self.fetch_series(ticker, target_day)
+            if series is not None and not getattr(series, "empty", True):
+                cache[ticker] = series
+        return cache
+
+
+YFINANCE_PROVIDER = YFinanceProvider()
+ALPHAVANTAGE_PROVIDER = AlphaVantageClient(os.environ.get("ALPHAVANTAGE_API_KEY"))
+TWELVEDATA_PROVIDER = TwelveDataClient(os.environ.get("TWELVEDATA_API_KEY"))
+IEX_PROVIDER = IEXCloudClient(os.environ.get("IEX_CLOUD_API_KEY"))
+FINNHUB_PROVIDER = FinnhubClient(os.environ.get("FINNHUB_API_KEY"))
+POLYGON_PROVIDER = PolygonClient(os.environ.get("POLYGON_API_KEY"))
+
+
+def _normalise_series(series: "pd.Series", session_day: date) -> "pd.Series":
+    if getattr(series.index, "tz", None) is None:
+        series = series.tz_localize(_ny_tz())  # type: ignore[attr-defined]
+    else:
+        series = series.tz_convert(_ny_tz())   # type: ignore[attr-defined]
+    try:
+        series = series.dropna().loc[str(session_day)]
+    except Exception:
+        series = series.dropna()
+    return series
+
+
+def _persist_intraday_cache(day: date, cache: Dict[str, "pd.Series"]) -> None:
+    if pd is None:
+        return
+    INTRADAY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    for ticker, series in cache.items():
+        if series is None or getattr(series, "empty", True):
+            continue
+        try:
+            frame = series.to_frame(name="close")
+            frame.to_csv(INTRADAY_CACHE_DIR / f"{day.isoformat()}__{ticker}.csv", index_label="timestamp")
+        except Exception as exc:
+            log(f"persist intraday {ticker} err: {exc}")
+
+
+def _load_intraday_from_disk(day: date, tickers: Optional[List[str]] = None) -> Dict[str, "pd.Series"]:
+    results: Dict[str, "pd.Series"] = {}
+    if pd is None:
+        return results
+    names = tickers if tickers is not None else list(TICKERS)
+    for ticker in names:
+        path = INTRADAY_CACHE_DIR / f"{day.isoformat()}__{ticker}.csv"
+        if not path.exists():
+            continue
+        try:
+            frame = pd.read_csv(path, index_col="timestamp", parse_dates=True)
+            series = frame["close"]
+            if getattr(series.index, "tz", None) is None:
+                series.index = series.index.tz_localize(_ny_tz())  # type: ignore[attr-defined]
+            else:
+                series.index = series.index.tz_convert(_ny_tz())   # type: ignore[attr-defined]
+            series = series.dropna()
+            try:
+                series = series.loc[str(day)]
+            except Exception:
+                pass
+            if not series.empty:
+                results[ticker] = series
+        except Exception as exc:
+            log(f"load persisted intraday {ticker} err: {exc}")
+    return results
+
+
+def _series_is_fresh(series: Optional["pd.Series"], session_day: date, now_dt: Optional[datetime] = None) -> bool:
+    if pd is None or series is None or getattr(series, "empty", True):
+        return False
+    now_dt = now_dt or now_eastern()
+    try:
+        last_ts = series.index[-1]
+    except Exception:
+        return False
+    try:
+        if getattr(last_ts, "tzinfo", None) is None:
+            last_ts = pd.Timestamp(last_ts, tz=_ny_tz())  # type: ignore[attr-defined]
         else:
-            _intraday_cache = {}
-            _intraday_cache_day = None
-    except Exception as e:
+            last_ts = cast("pd.Timestamp", last_ts).tz_convert(_ny_tz())  # type: ignore[attr-defined]
+    except Exception:
+        return False
+    if last_ts.date() != session_day:
+        return False
+    delta = now_dt - last_ts
+    return delta.total_seconds() <= 15 * 60
+
+async def _async_build_intraday_cache(day: date) -> Tuple[Dict[str, "pd.Series"], List[str], List[str]]:
+    new_cache: Dict[str, "pd.Series"] = {}
+    sources: List[str] = []
+
+    disk_cache = _load_intraday_from_disk(day)
+    if disk_cache:
+        new_cache.update(disk_cache)
+        sources.append("persisted")
+
+    missing = [tk for tk in TICKERS if tk not in new_cache]
+
+    if missing and YFINANCE_PROVIDER.available():
+        try:
+            chunk = await asyncio.to_thread(YFINANCE_PROVIDER.fetch, day, missing)
+        except Exception as exc:
+            log(f"yfinance primary fetch err: {exc}")
+        else:
+            filled = 0
+            for tk, series in (chunk or {}).items():
+                if series is None or getattr(series, "empty", True):
+                    continue
+                new_cache[tk] = _normalise_series(series, day)
+                filled += 1
+            if filled:
+                sources.append("yfinance")
+                log(f"intraday provider yfinance filled {filled} tickers (remaining {len(TICKERS) - len(new_cache)})")
+
+    missing = [tk for tk in TICKERS if tk not in new_cache]
+
+    async def _async_fetch_provider(provider, symbols):
+        try:
+            chunk = await asyncio.to_thread(provider.fetch, day, symbols)
+            return provider.name, chunk
+        except Exception as exc:
+            log(f"{provider.name} fetch err: {exc}")
+            return provider.name, {}
+
+    secondary = [
+        ALPHAVANTAGE_PROVIDER,
+        TWELVEDATA_PROVIDER,
+        IEX_PROVIDER,
+        FINNHUB_PROVIDER,
+        POLYGON_PROVIDER,
+    ]
+
+    while missing:
+        tasks = []
+        for provider in secondary:
+            if provider is None or not provider.available():
+                continue
+            tasks.append(asyncio.create_task(_async_fetch_provider(provider, missing)))
+        if not tasks:
+            break
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        before = len(new_cache)
+        for result in results:
+            if isinstance(result, Exception):
+                continue
+            name, chunk = result
+            if not isinstance(chunk, dict):
+                continue
+            added = 0
+            for tk, series in chunk.items():
+                if tk in new_cache or series is None or getattr(series, "empty", True):
+                    continue
+                new_cache[tk] = _normalise_series(series, day)
+                added += 1
+            if added:
+                sources.append(name)
+                log(f"intraday provider {name} filled {added} tickers (remaining {len(TICKERS) - len(new_cache)})")
+        if len(new_cache) == before:
+            break
+        missing = [tk for tk in TICKERS if tk not in new_cache]
+
+    missing = [tk for tk in TICKERS if tk not in new_cache]
+    return new_cache, sources, missing
+
+
+def _load_intraday_cache(target_day: Optional[date] = None, *, allow_backoff: bool = True) -> None:
+    """Populate the intraday cache with resilient async fallbacks."""
+    global _intraday_cache, _intraday_cache_day, _CACHE_BACKOFF_UNTIL, _CACHE_STALE_TICKERS, _CACHE_SOURCE
+    if pd is None:
+        return
+    day = target_day or now_eastern().date()
+    now_dt = now_eastern()
+    if (
+        allow_backoff
+        and _CACHE_BACKOFF_UNTIL is not None
+        and now_dt < _CACHE_BACKOFF_UNTIL
+        and _intraday_cache_day == day
+        and _intraday_cache
+    ):
+        return
+
+    try:
+        new_cache, sources, missing = asyncio.run(_async_build_intraday_cache(day))
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            new_cache, sources, missing = loop.run_until_complete(_async_build_intraday_cache(day))
+        finally:
+            loop.close()
+    except Exception as exc:
+        log(f"_load_intraday_cache err: {exc}")
+        new_cache = {}
+        sources = []
+        missing = list(TICKERS)
+
+    if not new_cache:
         _intraday_cache = {}
         _intraday_cache_day = None
-        log(f"_load_intraday_cache err: {e}")
+        _CACHE_STALE_TICKERS = set(TICKERS)
+        _CACHE_BACKOFF_UNTIL = now_dt + timedelta(minutes=3)
+        _CACHE_SOURCE = "empty"
+        return
+
+    _intraday_cache = new_cache
+    _intraday_cache_day = day
+    _persist_intraday_cache(day, new_cache)
+
+    stale: Set[str] = set()
+    for tk in TICKERS:
+        series = new_cache.get(tk)
+        if not _series_is_fresh(series, day, now_dt):
+            stale.add(tk)
+    stale.update(missing)
+
+    _CACHE_STALE_TICKERS = stale
+    _CACHE_SOURCE = " / ".join(sources) if sources else "cache"
+    _CACHE_BACKOFF_UNTIL = None if len(stale) < len(TICKERS) else now_dt + timedelta(minutes=3)
+    log(f"intraday cache source={_CACHE_SOURCE} stale={len(stale)} missing={len(missing)}")
 
 def series_for_day_1m(tk: str, session_day: date) -> Optional["pd.Series"]:
-    """
-    Return the cached 1-minute close price series for the given ticker
-    if available.  If the cache is empty or the ticker has not yet
-    been cached, fall back to a fresh yfinance.Ticker() call.  This
-    provides an escape hatch if the cache has not been loaded.
-    """
-    global _intraday_cache_day
-    if yf is None or pd is None:
+    """Return the cached 1-minute close price series for the given ticker."""
+    if pd is None:
         return None
     if _intraday_cache_day != session_day:
-        _load_intraday_cache(session_day)
-    s = _intraday_cache.get(tk)
-    if s is not None and not s.empty:
-        return s
-    try:
-        start = session_day
-        end = session_day + timedelta(days=1)
-        df = yf.Ticker(tk).history(start=start, end=end, interval="1m", prepost=False)
-        if _df_empty(df):
-            return None
-        ser = df["Close"]
-        if getattr(ser.index, "tz", None) is None:
-            ser = ser.tz_localize(_ny_tz())  # type: ignore[attr-defined]
-        else:
-            ser = ser.tz_convert(_ny_tz())   # type: ignore[attr-defined]
-        try:
-            ser = ser.dropna().loc[str(session_day)]
-        except Exception:
-            ser = ser.dropna()
-        if ser.empty:
-            return None
-        return ser
-    except Exception as e:
-        log(f"series_for_day_1m({tk}) err: {e}")
         return None
+    s = _intraday_cache.get(tk)
+    if s is not None and not getattr(s, "empty", True):
+        return s
+    return None
 
 def price_at_or_before_bucket(tk: str, session_day: date, h: int, m: int) -> Optional[float]:
     if pd is None:
@@ -1139,6 +1709,11 @@ class MainWindow(QMainWindow):
         self._last_pct_map: Dict[str, Optional[float]] = {}
         self.last_capture_label: Optional[str] = None
         self.last_capture_time: Optional[datetime] = None
+        self._executor = ThreadPoolExecutor(max_workers=3)
+        self._capture_future: Optional[Future] = None
+        self._pending_labels: List[str] = []
+        self._stale_tickers: Set[str] = set()
+        self._last_cache_source: str = ""
 
         # table
         self.table = QTableWidget(len(TICKERS), 1 + len(TIME_COLS))
@@ -1290,6 +1865,8 @@ class MainWindow(QMainWindow):
         self._last_pct_map = {}
         self.last_capture_label = None
         self.last_capture_time = None
+        self._stale_tickers = set()
+        self._last_cache_source = ""
         for r in range(len(TICKERS)):
             for c in range(1, 1 + len(TIME_COLS)):
                 blank = QTableWidgetItem("")
@@ -1304,8 +1881,6 @@ class MainWindow(QMainWindow):
             self._reset_for_new_session(target)
 
     def _ensure_prev_close(self, tk: str) -> Optional[float]:
-        if tk not in self.prev_close or self.prev_close[tk] is None:
-            self.prev_close[tk] = last_close(tk)
         return self.prev_close.get(tk)
 
     def _base_for(self, tk: str, label: str) -> Optional[float]:
@@ -1339,7 +1914,10 @@ class MainWindow(QMainWindow):
         it = QTableWidgetItem(text)
         col = GREEN if (isinstance(pct,(int,float)) and pct>0) else RED if (isinstance(pct,(int,float)) and pct<0) else NEUT
         it.setForeground(QBrush(col))
-        if self.features.get(FEATURE_CANDLE_GHOSTS, False):
+        if tk in self._stale_tickers:
+            it.setBackground(QBrush(QColor("#4f46e5")))
+            it.setToolTip("Stale price — awaiting fresh data refresh")
+        elif self.features.get(FEATURE_CANDLE_GHOSTS, False):
             prev = self._ensure_prev_close(tk)
             bg_color = QColor("#1e293b")
             if isinstance(prev, (int, float)) and isinstance(price, (int, float)):
@@ -1765,6 +2343,209 @@ class MainWindow(QMainWindow):
             DATA_DIR,
         )
 
+    # ---------- async capture orchestration ----------
+    def _active_capture(self) -> bool:
+        return self._capture_future is not None and not self._capture_future.done()
+
+    def _current_bucket_label(self) -> Optional[str]:
+        idx = self._bucket_index_now()
+        return INDEX_TO_LABEL[idx] if idx is not None else None
+
+    def _labels_to_capture(self, upto_idx: int) -> List[str]:
+        labels: List[str] = []
+        for idx in range(0, upto_idx + 1):
+            label = INDEX_TO_LABEL[idx]
+            has_values = any(
+                isinstance(self.bucket_prices.get(tk, {}).get(label), (int, float)) for tk in TICKERS
+            )
+            if not has_values:
+                labels.append(label)
+        if not labels and upto_idx >= 0:
+            labels.append(INDEX_TO_LABEL[upto_idx])
+        return labels
+
+    def _schedule_capture(self, labels: List[str], *, force_export: bool = False) -> None:
+        valid = [label for label in labels if label in LABEL_TO_INDEX]
+        if not valid:
+            return
+        if self._active_capture():
+            pending = ", ".join(self._pending_labels) or "capture"
+            self.statusBar().showMessage(f"Capture already running for {pending}…", 4000)
+            return
+
+        session_day = now_eastern().date()
+        self._ensure_session(session_day)
+        prev_snapshot = {tk: self.prev_close.get(tk) for tk in TICKERS}
+        self._pending_labels = list(valid)
+        log(f"capture scheduled: {valid}")
+        self.statusBar().showMessage(
+            f"Fetching {' · '.join(valid)}…", 0
+        )
+
+        future = self._executor.submit(self._build_capture_payload, session_day, list(valid), prev_snapshot)
+        self._capture_future = future
+
+        def _callback(fut: Future) -> None:
+            QTimer.singleShot(0, lambda: self._handle_capture_result(fut, force_export))
+
+        future.add_done_callback(_callback)
+
+    def _build_capture_payload(
+        self,
+        session_day: date,
+        labels: List[str],
+        prev_snapshot: Dict[str, Optional[float]],
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "session_date": session_day,
+            "captures": [],
+            "prev_close": {},
+            "stale": [],
+            "source": "",
+        }
+        try:
+            _load_intraday_cache(session_day, allow_backoff=False)
+            stale = set(_CACHE_STALE_TICKERS)
+            tzinfo = now_eastern().tzinfo
+
+            missing_prev = [tk for tk in TICKERS if prev_snapshot.get(tk) is None]
+            for tk in missing_prev:
+                value = last_close(tk)
+                if value is None:
+                    series = _intraday_cache.get(tk)
+                    if series is not None and not getattr(series, "empty", True):
+                        try:
+                            value = float(series.iloc[0])
+                        except Exception:
+                            value = None
+                payload["prev_close"][tk] = value
+                if value is None:
+                    stale.add(tk)
+
+            for label in labels:
+                idx = LABEL_TO_INDEX[label]
+                h, m = BUCKETS[idx][1]
+                price_map: Dict[str, Optional[float]] = {}
+                for tk in TICKERS:
+                    price = price_at_or_before_bucket(tk, session_day, h, m)
+                    price_map[tk] = price
+                    if not isinstance(price, (int, float)):
+                        stale.add(tk)
+                capture_dt = datetime.combine(session_day, time(hour=h, minute=m))
+                if tzinfo is not None:
+                    capture_dt = capture_dt.replace(tzinfo=tzinfo)
+                payload["captures"].append(
+                    {
+                        "label": label,
+                        "prices": price_map,
+                        "capture_dt": capture_dt,
+                    }
+                )
+
+            payload["stale"] = sorted(stale)
+            payload["source"] = _CACHE_SOURCE
+            return payload
+        except Exception as exc:
+            log(f"capture payload err: {exc}\n{traceback.format_exc()}")
+            raise
+
+    def _handle_capture_result(self, fut: Future, force_export: bool) -> None:
+        self._capture_future = None
+        self._pending_labels = []
+        try:
+            payload = fut.result()
+        except Exception as exc:
+            log(f"capture worker err: {exc}")
+            self.statusBar().showMessage("Capture failed — see tracker.log", 6000)
+            return
+
+        if not isinstance(payload, dict):
+            self.statusBar().showMessage("Capture returned no data.", 3000)
+            return
+
+        session_day = payload.get("session_date")
+        if isinstance(session_day, date):
+            self._ensure_session(session_day)
+
+        prev_map = payload.get("prev_close", {})
+        if isinstance(prev_map, dict):
+            for tk, val in prev_map.items():
+                if isinstance(val, (int, float)):
+                    self.prev_close[tk] = float(val)
+
+        stale_list = payload.get("stale", [])
+        if isinstance(stale_list, list):
+            self._stale_tickers = {tk for tk in stale_list if isinstance(tk, str)}
+        else:
+            self._stale_tickers = set()
+        self._last_cache_source = payload.get("source", "") or ""
+
+        captures = payload.get("captures", [])
+        if not isinstance(captures, list) or not captures:
+            self.statusBar().showMessage("No capture updates available.", 3000)
+            return
+
+        last_label: Optional[str] = None
+        last_dt: Optional[datetime] = None
+        last_pct_map: Dict[str, Optional[float]] = {}
+        for capture in captures:
+            if not isinstance(capture, dict):
+                continue
+            label = capture.get("label")
+            prices = capture.get("prices", {})
+            capture_dt = capture.get("capture_dt")
+            if not isinstance(label, str) or label not in LABEL_TO_INDEX:
+                continue
+            if not isinstance(prices, dict):
+                prices = {}
+            if isinstance(capture_dt, datetime):
+                dt_val = capture_dt
+            else:
+                dt_val = None
+
+            col = 1 + LABEL_TO_INDEX[label]
+            pct_map: Dict[str, Optional[float]] = {}
+            for row, tk in enumerate(TICKERS):
+                raw = prices.get(tk)
+                price_val = float(raw) if isinstance(raw, (int, float)) else None
+                self.bucket_prices.setdefault(tk, {})[label] = price_val
+                base = self._base_for(tk, label)
+                _txt, pct, item = self._render_cell(tk, label, price_val, base)
+                self.table.setItem(row, col, item)
+                pct_map[tk] = pct
+
+            export_force = force_export or label == "4:00 PM"
+            self._maybe_export(label, force=export_force)
+            self._post_capture_hooks(label, pct_map, dt_val)
+            last_label = label
+            last_dt = dt_val
+            last_pct_map = pct_map
+
+        if last_label:
+            log(f"capture complete: {last_label} source={self._last_cache_source or 'n/a'} stale={len(self._stale_tickers)}")
+            parts = [f"Captured {last_label}"]
+            if isinstance(last_dt, datetime):
+                display_dt = last_dt
+                if display_dt.tzinfo is None:
+                    display_dt = display_dt.replace(tzinfo=now_eastern().tzinfo)
+                parts.append(f"@ {format_et(display_dt)}")
+            if self._last_cache_source:
+                parts.append(f"source {self._last_cache_source}")
+            if self._stale_tickers:
+                parts.append(f"stale {len(self._stale_tickers)}")
+            self.statusBar().showMessage(" · ".join(parts), 6000)
+            if last_label == "4:00 PM":
+                self._finalize_exports()
+        else:
+            self.statusBar().showMessage("Capture completed with no updates.", 3000)
+
+    def _finalize_exports(self) -> None:
+        if pd is None or openpyxl is None:
+            return
+        for label in TIME_COLS:
+            if any(isinstance(self.bucket_prices.get(tk, {}).get(label), (int, float)) for tk in TICKERS):
+                self._maybe_export(label, force=True)
+
     # ---------- settings / features ----------
     def _load_features(self) -> Dict[str,bool]:
         defaults = {label: False for (label, _) in FEATURE_ITEMS}
@@ -1803,19 +2584,17 @@ class MainWindow(QMainWindow):
 
     # ---------- app logic ----------
     def initial_sync(self) -> None:
-        """
-        Perform the first data population when the application starts.  We
-        synchronously load the intraday cache and then backfill the grid
-        through the current bucket and capture it.  If any exception
-        occurs during loading or rendering, it is logged but does not
-        crash the UI.
-        """
+        """Prime the cache and queue captures without blocking the UI."""
         try:
-            _load_intraday_cache(self.session_date)
-            self.backfill_to_now()
-            self.refresh_now()
-            if self.features.get(FEATURE_MORNING_RESUME, False):
-                self._maybe_show_morning_resume()
+            now_dt = now_eastern()
+            self._ensure_session(now_dt.date())
+            idx_now = self._bucket_index_now((now_dt.hour, now_dt.minute))
+            if idx_now is None:
+                _load_intraday_cache(self.session_date, allow_backoff=False)
+                self.statusBar().showMessage("Waiting for market open — cache primed.", 4000)
+                return
+            labels = self._labels_to_capture(idx_now)
+            self._schedule_capture(labels)
         except Exception as e:
             log(f"initial_sync err: {e}")
 
@@ -1826,7 +2605,9 @@ class MainWindow(QMainWindow):
             return
         self._last_timer_key = hm
         if MARKET_OPEN <= hm <= MARKET_CLOSE:
-            self.refresh_now()
+            label = self._current_bucket_label()
+            if label is not None:
+                self._schedule_capture([label])
         else:
             self.statusBar().showMessage("Outside market hours — next capture at next session open.", 4000)
 
@@ -1849,86 +2630,27 @@ class MainWindow(QMainWindow):
         return idx if idx >= 0 else None
 
     def backfill_to_now(self) -> None:
-        if pd is None: return
         try:
             now_dt = now_eastern()
-            hm = (now_dt.hour, now_dt.minute)
-            tzinfo = now_dt.tzinfo
-            self._ensure_session(now_dt.date())
-            idx_now = self._bucket_index_now(hm)
-            if idx_now is None: return
-
-            for tk in TICKERS:
-                self._ensure_prev_close(tk)
-
-            for b in range(0, idx_now + 1):
-                col = 1 + b
-                h, m = BUCKETS[b][1]
-                label = INDEX_TO_LABEL[b]
-                pct_map: Dict[str, Optional[float]] = {}
-                for r, tk in enumerate(TICKERS):
-                    price = price_at_or_before_bucket(tk, self.session_date, h, m)
-                    base = self._base_for(tk, label)
-                    _txt, pct, item = self._render_cell(tk, label, price, base)
-                    self.table.setItem(r, col, item)
-                    self.bucket_prices[tk][label] = price if isinstance(price, (int, float)) else None
-                    pct_map[tk] = pct
-                self._maybe_export(label)
-                capture_dt = datetime(
-                    self.session_date.year,
-                    self.session_date.month,
-                    self.session_date.day,
-                    h,
-                    m,
-                    tzinfo=tzinfo,
-                )
-                self._post_capture_hooks(label, pct_map, capture_dt)
-
-            last_label = INDEX_TO_LABEL[idx_now]
-            self.statusBar().showMessage(f"Backfilled through {last_label} @ {format_et(now_dt)}", 4000)
-
+            idx_now = self._bucket_index_now((now_dt.hour, now_dt.minute))
+            if idx_now is None:
+                return
+            labels = self._labels_to_capture(idx_now)
+            if labels:
+                self._schedule_capture(labels)
         except Exception as e:
             log(f"backfill_to_now err: {e}")
 
     def refresh_now(self) -> None:
-        """
-        Capture the current bucket.  Before computing new values, we
-        refresh the intraday cache so that price_at_or_before_bucket()
-        uses up-to-date minute data.  This call is synchronous and may
-        take a few seconds, but it eliminates stale data between
-        buckets.  Any exceptions are logged and surfaced via a
-        message box.
-        """
+        """Queue a capture for the active bucket without blocking the UI."""
         try:
-            _load_intraday_cache(self.session_date)
-
             now_dt = now_eastern()
-            hm = (now_dt.hour, now_dt.minute)
             self._ensure_session(now_dt.date())
-            idx = self._bucket_index_now(hm)
-            label = INDEX_TO_LABEL.get(idx) if idx is not None else None
+            label = self._current_bucket_label()
             if label is None:
                 self.statusBar().showMessage("Pre-market — will capture starting 9:31 AM", 4000)
                 return
-
-            label_idx = LABEL_TO_INDEX[label]
-            col = 1 + label_idx
-
-            pct_map: Dict[str, Optional[float]] = {}
-            for r, tk in enumerate(TICKERS):
-                h, m = BUCKETS[label_idx][1]
-                price = price_at_or_before_bucket(tk, self.session_date, h, m)
-                self._ensure_prev_close(tk)
-                base = self._base_for(tk, label)
-                _txt, pct, item = self._render_cell(tk, label, price, base)
-                self.table.setItem(r, col, item)
-                self.bucket_prices[tk][label] = price if isinstance(price, (int, float)) else None
-                pct_map[tk] = pct
-
-            self._maybe_export(label)
-            self._post_capture_hooks(label, pct_map, now_dt)
-            self.statusBar().showMessage(f"Captured {label} @ {format_et(now_dt)}", 4000)
-
+            self._schedule_capture([label], force_export=label == "4:00 PM")
         except Exception:
             log("refresh_now fatal:\n" + traceback.format_exc())
             QMessageBox.warning(self, APP_NAME, "Refresh failed. See tracker.log for details.")
@@ -2181,6 +2903,13 @@ class MainWindow(QMainWindow):
         self.showNormal(); self.activateWindow(); self.raise_()
 
     def exit_app(self) -> None:
+        try:
+            self._finalize_exports()
+        finally:
+            try:
+                self._executor.shutdown(wait=False)
+            except Exception:
+                pass
         QApplication.quit()
 
     def closeEvent(self, e: QCloseEvent) -> None:
@@ -2220,12 +2949,25 @@ class MainWindow(QMainWindow):
         return inst.style().standardIcon(QStyle.SP_ComputerIcon) if inst else QIcon()
 
 # -------- main --------
+def _atexit_flush() -> None:
+    try:
+        if ACTIVE_WINDOW is not None:
+            ACTIVE_WINDOW._finalize_exports()
+    except Exception as exc:
+        log(f"atexit finalize err: {exc}")
+
+
+atexit.register(_atexit_flush)
+
+
 def main() -> None:
     ensure_single_instance()
     sock = start_primary_socket()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME); app.setQuitOnLastWindowClosed(False)
     w = MainWindow()
+    global ACTIVE_WINDOW
+    ACTIVE_WINDOW = w
     socket_listener(sock, on_show=w.show_main)
     w.show()
     sys.exit(app.exec_())
